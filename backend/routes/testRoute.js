@@ -7,7 +7,7 @@ const router = express.Router();
 router.get("/add", async (req, res) => {
   try {
     const doc = new Test({
-      name: "Aya",
+      name: "hajaokhra",
       message: "MongoDB is working 🚀"
     });
 
