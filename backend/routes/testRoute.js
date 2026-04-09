@@ -18,6 +18,7 @@ router.get("/add", async (req, res) => {
       data: doc
     });
 
+
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
