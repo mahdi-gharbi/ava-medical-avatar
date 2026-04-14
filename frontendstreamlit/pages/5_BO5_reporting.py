@@ -100,9 +100,15 @@ st.title("📄 BO5 - Reporting avec IA")
 st.write("Génération de rapports intelligents utilisant Groq LLM + Chroma")
 
 # ========================================
-# SIDEBAR FILTERS
+# TABS FOR DIFFERENT FUNCTIONALITIES
 # ========================================
-st.sidebar.header("📋 Paramètres Rapport")
+tab1, tab2 = st.tabs(["📝 Analyse Conversation", "🎯 Fine-tuning Tests"])
+
+with tab1:
+    # ========================================
+    # SIDEBAR FILTERS (TAB 1)
+    # ========================================
+    st.sidebar.header("📋 Paramètres Rapport")
 
 rapport_type = st.sidebar.selectbox(
     "Type de rapport",
@@ -522,3 +528,216 @@ else:
     MÉDECIN: Réaction...
     ```
     """)
+
+
+# ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+# TAB 2: 🎯 FINE-TUNING TESTS
+# ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+
+with tab2:
+    st.header("🎯 Fine-tuning ML Classifier")
+    st.write("Testez et validez les performances du ML classifier avec les données VITAL")
+    
+    # ========================================
+    # DATASET SELECTION
+    # ========================================
+    st.subheader("📊 Sélection du Dataset")
+    
+    dataset_choice = st.selectbox(
+        "Choisissez le dataset pour les tests:",
+        [
+            "vital_bo6_dataset.csv (Transcripts visites médicales)",
+            "parapharmacie_vital_final_v2.json (Produits parapharmacie)"
+        ]
+    )
+    
+    # ========================================
+    # LOAD & TEST DATASET
+    # ========================================
+    if dataset_choice == "vital_bo6_dataset.csv (Transcripts visites médicales)":
+        try:
+            csv_path = os.path.join(BACKEND_DIR, "data", "vital_bo6_dataset.csv")
+            df = pd.read_csv(csv_path)
+            st.success(f"✅ Dataset chargé: {len(df)} visites médicales")
+            
+            # Preview
+            st.subheader("👀 Aperçu du Dataset")
+            st.dataframe(df.head(), use_container_width=True)
+            
+            # Stats
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Visites", len(df))
+            with col2:
+                st.metric("Objections Uniques", df['main_objection_type'].nunique() if 'main_objection_type' in df.columns else 0)
+            with col3:
+                avg_sentiment = df['sentiment_score'].mean() if 'sentiment_score' in df.columns else 0
+                st.metric("Sentiment Moyen", f"{avg_sentiment:.2f}")
+            
+            # ========================================
+            # TESTING OPTIONS
+            # ========================================
+            st.subheader("🧪 Tests Fine-tuning")
+            
+            test_mode = st.radio(
+                "Mode de test:",
+                [
+                    "🎲 Visite Aléatoire",
+                    "📋 Batch Test (N visites)",
+                    "🧠 Évaluer Modèle Complet"
+                ],
+                horizontal=True
+            )
+            
+            # SESSION STATE
+            if "bo5_test_mode" not in st.session_state:
+                st.session_state.bo5_test_mode = None
+            if "bo5_test_result" not in st.session_state:
+                st.session_state.bo5_test_result = None
+            
+            if test_mode == "🎲 Visite Aléatoire":
+                if st.button("🎲 Tirer une Visite Aléatoire"):
+                    st.session_state.bo5_test_mode = "random"
+                    st.session_state.bo5_test_result = None
+                
+                if st.session_state.bo5_test_mode == "random":
+                    selected = df.sample(1).iloc[0]
+                    transcript = selected.get('transcript', selected.get('text', str(selected)))
+                    
+                    st.markdown("### 📝 Visite Sélectionnée")
+                    st.text_area("Transcript:", transcript, height=200, disabled=True)
+                    
+                    if st.button("🔍 Analyser cette Visite"):
+                        with st.spinner("⏳ Analyse en cours..."):
+                            try:
+                                from rag.query.query_bo5_medical import analyze_conversation
+                                result = analyze_conversation(transcript, "Analyse Objections", top_k=5)
+                                st.session_state.bo5_test_result = result
+                            except Exception as e:
+                                st.error(f"Erreur: {e}")
+                    
+                    if st.session_state.bo5_test_result:
+                        result = st.session_state.bo5_test_result
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("**Ground Truth (Dataset)**")
+                            st.write(f"Objection: {selected.get('main_objection_type', 'N/A')}")
+                            st.write(f"Sentiment: {selected.get('sentiment_score', 'N/A')}")
+                            st.write(f"Intérêt: {selected.get('interest_level', 'N/A')}")
+                        
+                        with col2:
+                            st.markdown("**Prédiction IA**")
+                            st.write(f"Objection: {result.get('predicted_main_objection', 'N/A')}")
+                            st.write(f"Sentiment: {result.get('predicted_sentiment', 0):.2f}")
+                            st.write(f"Intérêt: {result.get('predicted_interest', 0)}")
+                        
+                        if result.get('predicted_main_objection') == selected.get('main_objection_type'):
+                            st.success("✅ Objection correctement prédite !")
+                        else:
+                            st.warning("⚠️ Objection ne correspond pas")
+            
+            elif test_mode == "📋 Batch Test (N visites)":
+                batch_size = st.slider("Nombre de visites à tester", 5, min(30, len(df)), 10)
+                
+                if st.button(f"🚀 Lancer Batch Test ({batch_size} visites)"):
+                    from rag.query.query_bo5_medical import analyze_conversation
+                    
+                    sample_df = df.sample(min(batch_size, len(df)))
+                    results_batch = []
+                    
+                    progress_bar = st.progress(0)
+                    for i, (_, row) in enumerate(sample_df.iterrows()):
+                        try:
+                            transcript = row.get('transcript', row.get('text', str(row)))
+                            result = analyze_conversation(transcript, "Analyse Objections", top_k=3)
+                            predicted = result.get('predicted_main_objection')
+                            truth = row.get('main_objection_type')
+                            match = predicted == truth
+                            
+                            results_batch.append({
+                                'Ground Truth': truth,
+                                'Prédiction': predicted,
+                                'Match': '✅' if match else '❌',
+                                'Confiance': f"{result.get('predicted_objection_score', 0):.2f}"
+                            })
+                        except Exception as e:
+                            st.warning(f"⚠️ Erreur visite {i}")
+                        
+                        progress_bar.progress((i + 1) / len(sample_df))
+                    
+                    # Résultats
+                    st.subheader("📊 Résultats du Batch")
+                    results_df = pd.DataFrame(results_batch)
+                    st.dataframe(results_df, use_container_width=True)
+                    
+                    # Metrics
+                    correct = sum(1 for r in results_batch if r['Match'] == '✅')
+                    accuracy = correct / len(results_batch) if results_batch else 0
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Tests Réussis", len(results_batch))
+                    with col2:
+                        st.metric("Prédictions Correctes", correct)
+                    with col3:
+                        st.metric("Accuracy", f"{accuracy:.1%}")
+            
+            elif test_mode == "🧠 Évaluer Modèle Complet":
+                if st.button("🧠 Évaluer le Classifier ML"):
+                    with st.spinner("⏳ Évaluation du modèle en cours..."):
+                        try:
+                            from rag.query.query_bo5_medical import evaluate_objection_classifier
+                            eval_report = evaluate_objection_classifier()
+                            
+                            st.success(f"✅ Évaluation Terminée")
+                            
+                            # Metrics principales
+                            col1, col2, col3, col4 = st.columns(4)
+                            with col1:
+                                st.metric("Accuracy", f"{eval_report['validation_accuracy']:.1%}")
+                            with col2:
+                                st.metric("Train Accuracy", f"{eval_report['train_accuracy']:.1%}")
+                            with col3:
+                                st.metric("Total Samples", eval_report['total'])
+                            with col4:
+                                st.metric("Correct", eval_report['correct'])
+                            
+                            # Classification Report
+                            st.subheader("📊 Rapport de Classification")
+                            report_df = pd.DataFrame(eval_report['classification_report']).transpose()
+                            st.dataframe(report_df, use_container_width=True)
+                            
+                            # Predictions détaillées
+                            st.subheader("🔍 Exemples de Prédictions")
+                            pred_df = pd.DataFrame(eval_report['predictions'][:10])
+                            st.dataframe(pred_df, use_container_width=True)
+                            
+                        except Exception as e:
+                            st.error(f"❌ Erreur évaluation: {str(e)}")
+        
+        except Exception as e:
+            st.error(f"❌ Erreur chargement dataset CSV: {str(e)}")
+    
+    elif dataset_choice == "parapharmacie_vital_final_v2.json (Produits parapharmacie)":
+        try:
+            json_path = os.path.join(BACKEND_DIR, "data", "parapharmacie_vital_final_v2.json")
+            with open(json_path, "r", encoding="utf-8") as f:
+                products = json.load(f)
+            
+            st.success(f"✅ Dataset chargé: {len(products)} produits")
+            
+            # Preview
+            st.subheader("👀 Aperçu Produits")
+            df_prod = pd.DataFrame(products)
+            st.dataframe(df_prod[['name', 'gamme']].head(10) if 'name' in df_prod.columns else df_prod.head(10), use_container_width=True)
+            
+            # Stats
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Produits", len(products))
+            with col2:
+                st.info("Test RAG Retrieval: Chercher dans la base de produits")
+        
+        except Exception as e:
+            st.error(f"❌ Erreur dataset JSON: {str(e)}")

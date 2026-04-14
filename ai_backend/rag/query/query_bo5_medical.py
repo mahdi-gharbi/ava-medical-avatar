@@ -1,13 +1,23 @@
 # ========================================
 # QUERY BO5 - Analyse Visite Médicale
+# HYBRID: RAG + ML Classifier
 # ========================================
 import os
 import re
 import sys
 import json
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from datetime import datetime
+from functools import lru_cache
+import pickle
+from sentence_transformers import SentenceTransformer, InputExample, losses
+from sentence_transformers.evaluation import EmbeddingSimilarityEvaluator
+from torch.utils.data import DataLoader
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
 
 # ========================================
 # FIX PATHS
@@ -30,6 +40,8 @@ try:
 except ImportError as e:
     print(f"⚠️ Erreur import services: {e}")
     raise
+
+EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
 
 # ========================================
@@ -143,8 +155,266 @@ def detect_objections(dialogue_text: str) -> list:
 
 
 # ========================================
+# 2B. SENTIMENT & INTÉRÊT PREDICTIONS
+# ========================================
+def predict_sentiment(dialogue_text: str) -> float:
+    """
+    Estime un score de sentiment simple basé sur un lexique.
+    Retourne: -1.0 (négatif) à +1.0 (positif)
+    """
+    positive_words = ["bien", "excellent", "meilleur", "amélioration", "sûr", "sûreté", "tolérance", "support", "disponible"]
+    negative_words = ["cher", "inquiet", "risque", "effets secondaires", "indisponible", "problème", "non", "pas", "doute"]
+
+    lower = dialogue_text.lower()
+    score = 0
+    for word in positive_words:
+        score += lower.count(word)
+    for word in negative_words:
+        score -= lower.count(word)
+
+    if score > 0:
+        return min(1.0, score / 5)
+    if score < 0:
+        return max(-1.0, score / 5)
+    return 0.0
+
+
+def predict_interest(dialogue_text: str) -> int:
+    """
+    Estime un niveau d'intérêt approximatif (0-100) pour le médecin.
+    """
+    interest_signals = ["intéressé", "intéressant", "oui", "ok", "d'accord", "bon", "très bien", "je vais"]
+    disinterest_signals = ["non", "pas intéressé", "je n'ai pas besoin", "plus tard", "trop cher", "déjà", "je suis pressé"]
+
+    lower = dialogue_text.lower()
+    score = 50
+    for word in interest_signals:
+        if word in lower:
+            score += 10
+    for word in disinterest_signals:
+        if word in lower:
+            score -= 10
+
+    return max(0, min(100, score))
+
+
+def cosine_similarity(vec_a, vec_b):
+    """Retourne la similarité cosinus entre deux vecteurs."""
+    norm_a = np.linalg.norm(vec_a)
+    norm_b = np.linalg.norm(vec_b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(vec_a, vec_b) / (norm_a * norm_b))
+
+
+@lru_cache(maxsize=1)
+def get_sentence_transformer() -> SentenceTransformer:
+    """Chargement du modèle d'embedding pour fine-tuning local."""
+    return SentenceTransformer(EMBED_MODEL)
+
+
+def normalize_objection_label(label: str) -> str:
+    label = str(label).strip().upper()
+    if label in {'PRICE', 'COST'}:
+        return 'PRICE_OBJECTION'
+    if label in {'SAFETY', 'ASK_SAFETY'}:
+        return 'ASK_SAFETY'
+    if label in {'EFFICACY', 'ASK_EFFICACY'}:
+        return 'ASK_EFFICACY'
+    if label in {'STOCK', 'STOCK_AVAILABILITY'}:
+        return 'STOCK_AVAILABILITY'
+    if label in {'REIMBURSEMENT', 'CNAM', 'CNAM_REIMBURSEMENT'}:
+        return 'CNAM_REIMBURSEMENT'
+    if label == 'COMPETITOR_COMPARISON':
+        return label
+    return label
+
+
+def load_objection_dataset(csv_path: str = None) -> pd.DataFrame:
+    if csv_path is None:
+        csv_path = os.path.join(PROJECT_ROOT, 'ai_backend', 'data', 'vital_bo6_dataset.csv')
+
+    if not os.path.exists(csv_path):
+        print(f"⚠️  Dataset non trouvé: {csv_path}")
+        return pd.DataFrame()
+
+    df = pd.read_csv(csv_path)
+    df = df.dropna(subset=['transcript', 'main_objection_type']).copy()
+    df['main_objection_type'] = df['main_objection_type'].apply(normalize_objection_label)
+    df = df[df['main_objection_type'].isin({
+        'ASK_SAFETY', 'ASK_EFFICACY', 'STOCK_AVAILABILITY',
+        'CNAM_REIMBURSEMENT', 'PRICE_OBJECTION', 'COMPETITOR_COMPARISON'
+    })]
+    df = df.drop_duplicates(subset=['transcript', 'main_objection_type'])
+    return df
+
+
+@lru_cache(maxsize=1)
+def train_objection_classifier(csv_path: str = None, test_size: float = 0.2, random_state: int = 42) -> dict:
+    """Entraîne un classifieur local sur les embeddings du dataset et conserve une validation hold-out."""
+    df = load_objection_dataset(csv_path)
+
+    if df.empty:
+        print("⚠️  Dataset vide - classifier non entraîné")
+        return {"error": "Dataset vide"}
+
+    embedder = get_sentence_transformer()
+    texts = df['transcript'].astype(str).tolist()
+    labels = df['main_objection_type'].astype(str).tolist()
+
+    # Split train/validation with stratification
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        texts,
+        labels,
+        test_size=test_size,
+        stratify=labels,
+        random_state=random_state
+    )
+
+    X_train_embeddings = embedder.encode(X_train, convert_to_numpy=True, show_progress_bar=False)
+    X_valid_embeddings = embedder.encode(X_valid, convert_to_numpy=True, show_progress_bar=False)
+
+    classifier = LogisticRegression(
+        max_iter=2000,
+        solver='lbfgs',
+        class_weight='balanced',
+        random_state=random_state
+    )
+    classifier.fit(X_train_embeddings, y_train)
+
+    train_predictions = classifier.predict(X_train_embeddings)
+    train_accuracy = float(accuracy_score(y_train, train_predictions))
+
+    valid_predictions = classifier.predict(X_valid_embeddings)
+    valid_accuracy = float(accuracy_score(y_valid, valid_predictions))
+
+    return {
+        'classifier': classifier,
+        'embedder': embedder,
+        'X_train': X_train,
+        'y_train': y_train,
+        'X_valid': X_valid,
+        'y_valid': y_valid,
+        'X_train_embeddings': X_train_embeddings,
+        'X_valid_embeddings': X_valid_embeddings,
+        'train_accuracy': train_accuracy,
+        'validation_accuracy': valid_accuracy,
+        'train_predictions': train_predictions,
+        'validation_predictions': valid_predictions,
+        'classes': classifier.classes_
+    }
+
+
+def predict_main_objection_type(dialogue_text: str) -> tuple:
+    """Prédit le type d'objection principal en utilisant des règles et un classifieur appris."""
+    lower = dialogue_text.lower()
+    keyword_patterns = [
+        ('COMPETITOR_COMPARISON', ['concurrent', 'produit concurrent', 'pourquoi changer', 'comparaison', 'alternatives']),
+        ('CNAM_REIMBURSEMENT', ['cnam', 'remboursement', 'couverture', 'assurance', 'prise en charge', 'remboursé']),
+        ('PRICE_OBJECTION', ['prix', 'coût', 'budget', 'tarif', 'trop cher', 'cher', 'prix élevé']),
+        ('ASK_SAFETY', ['effets secondaires', 'sécurité', 'risque', 'tolérance', 'inquiet', 'inquiète', 'allergie', 'toléré']),
+        ('ASK_EFFICACY', ['efficacité', 'efficace', 'preuve', 'étude', 'study', 'résultats', 'amélioration', 'performant']),
+        ('STOCK_AVAILABILITY', ['stock', 'disponible', 'grossiste', 'livraison', 'rupture', 'en stock', 'disponibilité', 'approvisionnement'])
+    ]
+
+    for label, keywords in keyword_patterns:
+        if any(keyword in lower for keyword in keywords):
+            return label, 0.92
+
+    try:
+        trained = train_objection_classifier()
+        if "error" in trained:
+            return "PRICE_OBJECTION", 0.5
+        
+        emb = get_sentence_transformer().encode([dialogue_text], convert_to_numpy=True, show_progress_bar=False)[0]
+        predicted = trained['classifier'].predict([emb])[0]
+        proba = trained['classifier'].predict_proba([emb])[0]
+        best_score = float(max(proba))
+
+        return predicted, best_score
+    except Exception as e:
+        print(f"⚠️  Erreur classifier: {e}")
+        return "PRICE_OBJECTION", 0.5
+
+
+def extract_objection_sentence(text: str, label: str, max_len: int = 140) -> str:
+    label = normalize_objection_label(label)
+    sentence_keywords = {
+        'ASK_SAFETY': ['effets secondaires', 'sécurité', 'risque', 'tolérance', 'inquiet', 'inquiète', 'allergie', 'contre-indication', 'douleur'],
+        'ASK_EFFICACY': ['efficacité', 'étude', 'preuves', 'données cliniques', 'performance', 'résultats', 'fonctionne', 'prouvé', 'amélioration'],
+        'PRICE_OBJECTION': ['prix', 'coût', 'budget', 'tarif', 'trop cher', 'cher', 'facturation'],
+        'STOCK_AVAILABILITY': ['stock', 'disponible', 'indisponible', 'rupture', 'en stock', 'disponibilité', 'livraison', 'approvisionnement'],
+        'CNAM_REIMBURSEMENT': ['cnam', 'remboursement', 'couverture', 'prise en charge', 'assurance', 'remboursé'],
+        'COMPETITOR_COMPARISON': ['concurrent', 'produit concurrent', 'comparaison', 'alternatives', 'autre produit', 'concurrence', 'autre marque']
+    }
+    keywords = sentence_keywords.get(label, [])
+    sentences = re.split(r'(?<=[\.\?\!])\s+', text.replace('\n', ' '))
+    for sentence in sentences:
+        lower = sentence.lower()
+        if any(keyword in lower for keyword in keywords):
+            excerpt = sentence.strip()
+            return excerpt if len(excerpt) <= max_len else excerpt[:max_len].rstrip() + '...'
+    # Fallback sur la première phrase
+    first = sentences[0].strip() if sentences else text.strip()
+    return first if len(first) <= max_len else first[:max_len].rstrip() + '...'
+
+
+def evaluate_objection_classifier(csv_path: str = None) -> dict:
+    """Évalue le classifieur local sur un jeu de validation séparé."""
+    trained = train_objection_classifier(csv_path)
+
+    if "error" in trained:
+        return {"error": "Classifier non disponible"}
+
+    y_valid = trained['y_valid']
+    y_pred = trained['validation_predictions']
+    proba = trained['classifier'].predict_proba(trained['X_valid_embeddings'])
+
+    accuracy = float(accuracy_score(y_valid, y_pred))
+    report = classification_report(y_valid, y_pred, output_dict=True, zero_division=0)
+
+    predictions = []
+    for true_label, pred_label, scores, text in zip(
+        y_valid,
+        y_pred,
+        proba,
+        trained['X_valid']
+    ):
+        predictions.append({
+            'true': true_label,
+            'predicted': pred_label,
+            'confidence': float(max(scores)),
+            'excerpt': extract_objection_sentence(text, true_label)
+        })
+
+    return {
+        'accuracy': accuracy,
+        'total': len(y_valid),
+        'correct': int(sum(1 for true, pred in zip(y_valid, y_pred) if true == pred)),
+        'train_accuracy': trained['train_accuracy'],
+        'validation_accuracy': accuracy,
+        'classification_report': report,
+        'predictions': predictions[:50]
+    }
+
+
+# ========================================
 # 3. STRATÉGIES D'OBJECTIONS (AMÉLIORÉ)
 # ========================================
+def safe_generate_response(query: str, context_docs: list, system_prompt: str = None) -> str:
+    """
+    Génère une réponse en sécurité en capturant les erreurs Groq.
+    """
+    try:
+        return generate_response(query, context_docs, system_prompt)
+    except Exception as e:
+        err = str(e).lower()
+        if "quota groq" in err or "rate limit" in err or "tokens per day" in err or "rate_limit" in err:
+            return (
+                "⚠️ Analyse Groq temporairement indisponible : limite de tokens atteinte. "
+                "Réponse locale : analyse simplifiée basée sur le dialogue."
+            )
+        raise
 def get_objection_strategies(objection_type: str, context_docs: list, dialogue: str = "") -> str:
     """
     Génère une stratégie de réponse enrichie pour chaque objection
@@ -216,7 +486,7 @@ Contexte de la base de données:
 
 Génère une stratégie de réponse professionnelle et persuasive."""
     
-    strategy = generate_response(query, context_docs, system_prompt)
+    strategy = safe_generate_response(query, context_docs, system_prompt)
     
     return strategy
 
@@ -231,6 +501,7 @@ def analyze_conversation(
 ) -> dict:
     """
     Pipeline complet d'analyse d'une visite médicale
+    HYBRID: Detection Objections + ML Classifier + RAG Retrieval + LLM Generation
     """
     
     # Parser la conversation
@@ -286,7 +557,7 @@ Objections détectées: {len(objections)}
             "score": 0.0
         }]
     
-    analysis = generate_response(
+    analysis = safe_generate_response(
         analysis_query,
         context,
         system_prompt="""Tu es un analyseur expert en visites médicales.
@@ -297,11 +568,20 @@ Analyse le dialogue et fournis:
 4. Recommandations"""
     )
     
+    # 🔥 NEW: ML Predictions
+    predicted_main_objection, predicted_objection_score = predict_main_objection_type(dialogue)
+    predicted_sentiment = predict_sentiment(dialogue)
+    predicted_interest = predict_interest(dialogue)
+    
     return {
         "type": rapport_type,
         "analysis": analysis,
         "objections": enriched_objections,
         "sources": context,
+        "predicted_sentiment": predicted_sentiment,
+        "predicted_interest": predicted_interest,
+        "predicted_main_objection": predicted_main_objection,
+        "predicted_objection_score": predicted_objection_score,
         "key_points": {
             "Total Exchanges": len(exchanges),
             "Objections Found": len(objections),
