@@ -6,6 +6,10 @@ import pandas as pd
 import sys
 import os
 from datetime import datetime
+import plotly.graph_objects as go
+import plotly.express as px
+from fpdf import FPDF
+import re
 
 # ========================================
 # FIX PATHS
@@ -16,6 +20,72 @@ BACKEND_DIR = os.path.join(BASE_DIR, "ai_backend")
 # Ajouter la racine au début du path
 sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, BACKEND_DIR)
+
+# ========================================
+# FONCTION POUR GÉNÉRER PDF
+# ========================================
+def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
+    """Génère un PDF du rapport"""
+    try:
+        pdf = FPDF(format='A4', unit='mm')
+        pdf.set_margins(15, 15, 15)
+        pdf.add_page()
+        
+        # Titre
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.write(8, "RAPPORT BO5 - ANALYSE DE VISITE\n\n")
+        
+        # Date
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.write(5, f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n")
+        pdf.ln(3)
+        
+        # Résumé
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.write(6, "Resume de la Visite\n")
+        pdf.set_font("Helvetica", "", 9)
+        
+        analysis_text = result.get("analysis", "Pas d'analyse")
+        first_lines = "\n".join(analysis_text.split('\n')[:2])[:300]
+        pdf.write(5, first_lines + "\n\n")
+        
+        # Score
+        score_match = re.search(r'(\d+)\s*/\s*100', analysis_text)
+        score = int(score_match.group(1)) if score_match else 50
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.write(6, f"Score Performance: {score}/100\n")
+        pdf.ln(3)
+        
+        # Objections
+        if result.get("objections"):
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.write(6, f"Objections ({len(result['objections'])})\n")
+            pdf.set_font("Helvetica", "", 8)
+            
+            for i, obj in enumerate(result["objections"][:3], 1):
+                text = f"{i}. {obj['type']}: {obj['text'][:60]}\n"
+                pdf.write(4, text)
+            pdf.ln(2)
+        
+        # Points clés
+        if result.get("key_points"):
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.write(6, "Points Cles\n")
+            pdf.set_font("Helvetica", "", 8)
+            
+            for key, value in list(result.get("key_points", {}).items())[:3]:
+                text = f"- {key}: {str(value)[:40]}\n"
+                pdf.write(4, text)
+        
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "I", 7)
+        pdf.write(4, "Rapport genere par systeme BO5 - Confidential")
+        
+        pdf_output = pdf.output(dest='S')
+        return bytes(pdf_output)
+    except Exception as e:
+        print(f"[PDF ERROR] {str(e)}")
+        raise
 
 # ========================================
 # PAGE CONFIG
@@ -209,39 +279,193 @@ if generate_btn:
                 # Display Response
                 st.success("✅ Rapport généré!")
                 
-                # Afficher analyse
-                col1, col2 = st.columns([2, 1])
+                # ========================================
+                # RÉSUMÉ COURT DE LA VISITE
+                # ========================================
+                st.markdown("---")
+                st.markdown("### 📋 Résumé de la Visite")
                 
-                with col1:
-                    st.markdown("### 📝 Analyse IA")
+                # Générer un résumé court de ce qui s'est passé
+                try:
+                    from services.rag_service import generate_response
+                    
+                    # Créer un prompt pour résumer la visite
+                    resume_prompt = f"""Basé sur cette conversation entre un délégué médical et un médecin, fais un résumé TRÈS COURT (3-4 lignes maximum) de:
+- Ce qui a été présenté/discuté
+- Les objections principales du médecin
+- Conclusion/accord
+
+Sois concis et factuel.
+
+Conversation:
+{query_input}"""
+                    
+                    resume = generate_response(
+                        query=resume_prompt,
+                        context_docs=[],
+                        system_prompt="Tu es un résumeur d'entretiens médicaux. Soit très concis."
+                    )
+                    
+                    st.markdown(f"**{resume}**")
+                    
+                except Exception as e:
+                    # Si la génération échoue, créer un résumé basé sur l'analyse
+                    first_lines = "\n".join(result["analysis"].split('\n')[:3])
+                    st.markdown(f"**{first_lines}**")
+                
+                # ========================================
+                # DÉTAILS DÉPLIABLES
+                # ========================================
+                st.markdown("---")
+                st.markdown("### 📖 Détails Complets")
+                
+                # Stats du rapport
+                num_objections = len(result.get("objections", []))
+                num_sources = len(result.get("sources", []))
+                avg_score = sum(s["score"] for s in result.get("sources", [])) / num_sources if num_sources > 0 else 0
+                
+                # ========================================
+                # ANALYSE SIGNIFICATIVE DE LA VISITE
+                # ========================================
+                with st.expander("🎯 Évaluation de la Visite", expanded=True):
+                    # Générer des insights significatifs
+                    visite_score = None
+                    try:
+                        from services.rag_service import generate_response
+                        import re
+                        
+                        insights_prompt = f"""Analyse cette visite médicale et donne une évaluation STRUCTURÉE avec:
+1. **Score Global** (X/100): Comment s'est déroulée la visite globalement?
+2. **Points Forts** (2-3 bullets): Qu'est-ce qui a bien marché?
+3. **Points Faibles** (2-3 bullets): Qu'est-ce qui aurait pu mieux se passer?
+4. **Risques** (si applicable): Y a-t-il des risques identifiés?
+5. **Recommandations** (2-3 bullets): Que faire pour la prochaine visite?
+
+IMPORTANT: Format le score EXACTEMENT comme "Score Global: 45/100"
+
+Conversation:
+{query_input}"""
+                        
+                        insights = generate_response(
+                            query=insights_prompt,
+                            context_docs=[],
+                            system_prompt="Tu es un expert en ventes médicales. Fournis une analyse constructive et actionnable. Utilise le format exact pour le score: 'Score Global: XX/100'"
+                        )
+                        
+                        st.markdown(insights)
+                        
+                        # Extraire le score du rapport avec le pattern XX/100
+                        score_match = re.search(r'(\d+)\s*/\s*100', insights)
+                        if score_match:
+                            visite_score = int(score_match.group(1))
+                            print(f"[DEBUG] Score extrait: {visite_score}")
+                        else:
+                            print(f"[DEBUG] Pas de score trouvé dans: {insights[:200]}")
+                        
+                    except Exception as e:
+                        st.warning(f"⚠️ Impossible de générer l'analyse détaillée: {str(e)}")
+                    
+                    # Visualisation du score de visite
+                    st.markdown("---")
+                    
+                    # Créer un gauge chart pour le score de visite
+                    if visite_score is None:
+                        # Si on n'a pas pu extraire le score, utiliser la formule par défaut
+                        if num_objections > 0:
+                            visite_score = min(100, 50 + (num_objections * 8) + (avg_score * 30))
+                        else:
+                            visite_score = 70 + (avg_score * 30)
+                        print(f"[DEBUG] Score par défaut calculé: {visite_score}")
+                    
+                    visite_score = min(100, max(0, visite_score))
+                    
+                    fig_gauge = go.Figure(go.Indicator(
+                        mode="gauge+number+delta",
+                        value=visite_score,
+                        domain={'x': [0, 1], 'y': [0, 1]},
+                        title={'text': "Performance de la Visite"},
+                        delta={'reference': 50},
+                        gauge={
+                            'axis': {'range': [None, 100]},
+                            'bar': {'color': "darkblue"},
+                            'steps': [
+                                {'range': [0, 33], 'color': "lightgray"},
+                                {'range': [33, 66], 'color': "gray"},
+                                {'range': [66, 100], 'color': "lightgreen"}
+                            ],
+                            'threshold': {
+                                'line': {'color': "red", 'width': 4},
+                                'thickness': 0.75,
+                                'value': 90
+                            }
+                        }
+                    ))
+                    st.plotly_chart(fig_gauge, use_container_width=True)
+                
+                # Analyse détaillée en expander
+                with st.expander("📝 Analyse Complète IA", expanded=False):
                     st.write(result["analysis"])
                 
-                with col2:
-                    st.markdown("### 🎯 Points Clés")
-                    for key, value in result.get("key_points", {}).items():
-                        st.write(f"**{key}:** {value}")
+                # Points clés en expander avec tableau
+                with st.expander("🎯 Points Clés & Statistiques", expanded=False):
+                    if result.get("key_points"):
+                        key_points_data = pd.DataFrame([
+                            {"Métrique": key, "Valeur": value}
+                            for key, value in result.get("key_points", {}).items()
+                        ])
+                        st.dataframe(key_points_data, use_container_width=True)
+                    else:
+                        for key, value in result.get("key_points", {}).items():
+                            st.write(f"**{key}:** {value}")
                 
-                # Objections détectées
+                # Objections détectées avec analyse
                 if result.get("objections"):
-                    st.markdown("### 🚫 Objections Détectées")
-                    for i, obj in enumerate(result["objections"], 1):
-                        with st.expander(f"Objection {i}: {obj['type']}"):
-                            st.write(f"**Énoncé:** {obj['text']}")
-                            st.write(f"**Stratégie:** {obj['strategy']}")
+                    with st.expander(f"🚫 Objections Détectées ({num_objections})", expanded=False):
+                        # Tableau des objections avec stratégies mieux visibles
+                        objections_data = pd.DataFrame([
+                            {
+                                "Objection": obj['type'],
+                                "Énoncé": obj['text'][:50] + "..." if len(obj['text']) > 50 else obj['text'],
+                            }
+                            for obj in result["objections"]
+                        ])
+                        st.dataframe(objections_data, use_container_width=True)
+                        
+                        # Stratégies pour chaque objection
+                        st.markdown("**✅ Stratégies de Réponse:**")
+                        for i, obj in enumerate(result["objections"], 1):
+                            col1, col2 = st.columns([1, 3])
+                            with col1:
+                                st.write(f"**{obj['type']}:**")
+                            with col2:
+                                st.write(obj['strategy'])
                 
-                # Sources
-                st.markdown("### 📚 Sources Utilisées")
-                for i, source in enumerate(result["sources"], 1):
-                    with st.expander(f"Source {i} (Score: {source['score']:.3f})"):
-                        st.write(source["content"][:500] + "...")
+                # Sources avec contexte
+                with st.expander(f"📚 Sources Utilisées ({num_sources})", expanded=False):
+                    if num_sources > 0:
+                        st.info(f"Score moyen de pertinence: **{avg_score:.2f}** (plus proche de 1 = plus pertinent)")
+                        for i, source in enumerate(result["sources"], 1):
+                            col1, col2 = st.columns([1, 4])
+                            with col1:
+                                st.metric("Score", f"{source['score']:.2f}")
+                            with col2:
+                                st.write(source["content"][:300] + "...")
                 
                 # Export
                 st.markdown("---")
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    if st.button("📥 Télécharger en PDF"):
-                        st.info("PDF export coming soon...")
+                    try:
+                        pdf_bytes = generate_pdf_report(result, rapport_type)
+                        st.download_button(
+                            label="📥 Télécharger en PDF",
+                            data=pdf_bytes,
+                            file_name=f"rapport_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                            mime="application/pdf"
+                        )
+                    except Exception as e:
+                        st.error(f"❌ Erreur PDF: {str(e)}")
                 
                 with col2:
                     if st.button("📊 Exporter en JSON"):
