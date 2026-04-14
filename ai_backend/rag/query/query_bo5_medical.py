@@ -43,6 +43,172 @@ except ImportError as e:
 
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
+# ========================================
+# FINE-TUNING CONFIGURATION
+# ========================================
+FINETUNED_MODEL_PATH = AI_BACKEND_DIR / "models" / "finetuned_sentence_transformer"
+FINETUNED_MODEL_PATH.mkdir(parents=True, exist_ok=True)
+
+# ========================================
+# FINE-TUNING FUNCTIONS
+# ========================================
+def create_training_pairs(df: pd.DataFrame, text_column: str = 'transcript', label_column: str = 'main_objection_type') -> list:
+    """
+    Crée des paires (anchor, positive, negative) pour fine-tuning contrastif
+    Anchor = texte source
+    Positive = autre texte de même classe
+    Negative = texte de classe différente
+    """
+    pairs = []
+    
+    texts = df[text_column].astype(str).tolist()
+    labels = df[label_column].astype(str).tolist()
+    
+    # Grouper par classe
+    label_to_indices = {}
+    for idx, label in enumerate(labels):
+        if label not in label_to_indices:
+            label_to_indices[label] = []
+        label_to_indices[label].append(idx)
+    
+    # Créer des triplets
+    for anchor_idx, anchor_label in enumerate(labels):
+        anchor_text = texts[anchor_idx]
+        
+        # Positif: un autre texte de même classe
+        same_class_indices = label_to_indices[anchor_label]
+        if len(same_class_indices) > 1:
+            positive_idx = np.random.choice([i for i in same_class_indices if i != anchor_idx])
+            positive_text = texts[positive_idx]
+            
+            # Négatif: un texte de classe différente
+            different_labels = [l for l in label_to_indices.keys() if l != anchor_label]
+            if different_labels:
+                negative_label = np.random.choice(different_labels)
+                negative_idx = np.random.choice(label_to_indices[negative_label])
+                negative_text = texts[negative_idx]
+                
+                pairs.append(InputExample(texts=[anchor_text, positive_text, negative_text]))
+    
+    return pairs
+
+
+def fine_tune_sentence_transformer(csv_path: str = None, epochs: int = 2, batch_size: int = 16) -> SentenceTransformer:
+    """
+    Fine-tune le SentenceTransformer sur les données médicales
+    Utilise TripletLoss pour maximiser similarité intra-classe et minimiser inter-classe
+    """
+    print(f"🔧 Début du fine-tuning du SentenceTransformer...")
+    
+    # Charger dataset
+    if csv_path is None:
+        csv_path = os.path.join(AI_BACKEND_DIR, 'data', 'vital_bo6_dataset.csv')
+    
+    df = pd.read_csv(csv_path)
+    df = df.dropna(subset=['transcript', 'main_objection_type']).copy()
+    df['main_objection_type'] = df['main_objection_type'].apply(normalize_objection_label)
+    
+    print(f"📊 Dataset: {len(df)} samples")
+    
+    # Charger modèle pré-entraîné
+    model = SentenceTransformer(EMBED_MODEL)
+    
+    # Créer paires d'entraînement
+    train_examples = create_training_pairs(df)
+    print(f"📚 Paires créées: {len(train_examples)}")
+    
+    # DataLoader
+    train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=batch_size)
+    
+    # Loss: TripletLoss pour apprentissage métrique
+    train_loss = losses.TripletLoss(model=model)
+    
+    # Entraîner
+    print(f"🚀 Fine-tuning sur {epochs} epochs...")
+    model.fit(
+        train_objectives=[(train_dataloader, train_loss)],
+        epochs=epochs,
+        warmup_steps=100,
+        show_progress_bar=True
+    )
+    
+    # Sauvegarder modèle fine-tuné
+    model.save(str(FINETUNED_MODEL_PATH))
+    print(f"✅ Modèle fine-tuné sauvegardé: {FINETUNED_MODEL_PATH}")
+    
+    return model
+
+
+@lru_cache(maxsize=1)
+def get_sentence_transformer_finetuned() -> SentenceTransformer:
+    """Charge le modèle fine-tuné s'il existe, sinon charge le pré-entraîné"""
+    if (FINETUNED_MODEL_PATH / "pytorch_model.bin").exists():
+        print(f"✅ Chargement modèle fine-tuné: {FINETUNED_MODEL_PATH}")
+        return SentenceTransformer(str(FINETUNED_MODEL_PATH))
+    else:
+        print(f"⚠️ Pas de modèle fine-tuné trouvé. Utilisation du modèle pré-entraîné.")
+        return SentenceTransformer(EMBED_MODEL)
+
+
+def full_finetuning_pipeline(csv_path: str = None, epochs: int = 2, batch_size: int = 16) -> dict:
+    """
+    Pipeline complet de fine-tuning:
+    1. Fine-tune le SentenceTransformer
+    2. Réentraîne le classifier ML sur les embeddings fine-tunés
+    3. Retourne les métriques
+    """
+    print("\n" + "="*80)
+    print("🚀 PIPELINE COMPLET DE FINE-TUNING")
+    print("="*80)
+    
+    # Étape 1: Fine-tune SentenceTransformer
+    print("\n📍 Étape 1: Fine-tuning SentenceTransformer...")
+    finetuned_model = fine_tune_sentence_transformer(csv_path, epochs=epochs, batch_size=batch_size)
+    
+    # Étape 2: Invalider cache pour utiliser nouveau modèle
+    print("\n📍 Étape 2: Invalidation des caches...")
+    get_sentence_transformer.cache_clear()
+    get_sentence_transformer_finetuned.cache_clear()
+    
+    # Étape 3: Réentraîner classifier
+    print("\n📍 Étape 3: Réentraînement du classifier...")
+    df = load_objection_dataset(csv_path)
+    embedder = get_sentence_transformer()
+    
+    texts = df['transcript'].astype(str).tolist()
+    labels = df['main_objection_type'].astype(str).tolist()
+    
+    X_train, X_valid, y_train, y_valid = train_test_split(
+        texts, labels, test_size=0.2, stratify=labels, random_state=42
+    )
+    
+    X_train_embeddings = embedder.encode(X_train, convert_to_numpy=True, show_progress_bar=True)
+    X_valid_embeddings = embedder.encode(X_valid, convert_to_numpy=True, show_progress_bar=True)
+    
+    classifier = LogisticRegression(
+        max_iter=2000, solver='lbfgs', class_weight='balanced', random_state=42
+    )
+    classifier.fit(X_train_embeddings, y_train)
+    
+    train_pred = classifier.predict(X_train_embeddings)
+    valid_pred = classifier.predict(X_valid_embeddings)
+    
+    train_acc = accuracy_score(y_train, train_pred)
+    valid_acc = accuracy_score(y_valid, valid_pred)
+    
+    print("\n" + "="*80)
+    print("✅ FINE-TUNING TERMINÉ")
+    print("="*80)
+    
+    return {
+        'success': True,
+        'finetuned_model': finetuned_model,
+        'classifier': classifier,
+        'train_accuracy': float(train_acc),
+        'validation_accuracy': float(valid_acc),
+        'message': f"Accuracy: Train={train_acc:.1%}, Validation={valid_acc:.1%}"
+    }
+
 
 # ========================================
 # 1. PARSER CONVERSATION
@@ -209,8 +375,8 @@ def cosine_similarity(vec_a, vec_b):
 
 @lru_cache(maxsize=1)
 def get_sentence_transformer() -> SentenceTransformer:
-    """Chargement du modèle d'embedding pour fine-tuning local."""
-    return SentenceTransformer(EMBED_MODEL)
+    """Charge le modèle d'embedding (fine-tuné si disponible, sinon pré-entraîné)"""
+    return get_sentence_transformer_finetuned()
 
 
 def normalize_objection_label(label: str) -> str:
@@ -497,11 +663,13 @@ Génère une stratégie de réponse professionnelle et persuasive."""
 def analyze_conversation(
     dialogue: str,
     rapport_type: str = "Analyse Objections",
-    top_k: int = 5
+    top_k: int = 5,
+    use_finetuned: bool = True
 ) -> dict:
     """
     Pipeline complet d'analyse d'une visite médicale
     HYBRID: Detection Objections + ML Classifier + RAG Retrieval + LLM Generation
+    use_finetuned: Utiliser embeddings fine-tuned (True) ou standard (False)
     """
     
     # Parser la conversation
@@ -514,7 +682,7 @@ def analyze_conversation(
     # Récupérer contexte pour chaque objection
     enriched_objections = []
     for obj in objections:
-        context = retrieve_context(obj["text"], top_k=top_k)
+        context = retrieve_context(obj["text"], top_k=top_k, use_finetuned=use_finetuned)
         
         # 🔥 FILTRER: Garder SEULEMENT les sources avec bon score
         context = [c for c in context if c["score"] > 0.3]
@@ -545,7 +713,7 @@ Dialogue:
 Objections détectées: {len(objections)}
 """
     
-    context = retrieve_context(dialogue[:500], top_k=top_k)
+    context = retrieve_context(dialogue[:500], top_k=top_k, use_finetuned=use_finetuned)
     
     # 🔥 FILTRER: Garder seulement les sources avec bon score
     context = [c for c in context if c["score"] > 0.3]
@@ -573,6 +741,22 @@ Analyse le dialogue et fournis:
     predicted_sentiment = predict_sentiment(dialogue)
     predicted_interest = predict_interest(dialogue)
     
+    # 🔥 NEW: AMÉLIORATIONS - Extraire les nouvelles données
+    detected_language = detect_language(dialogue)
+    medical_specialty = detect_medical_specialty(dialogue)
+    engagement_data = detect_engagement(dialogue)
+    detected_needs = extract_detected_needs(dialogue)
+    client_typology = classify_client_typology(dialogue)
+    proposed_product = extract_proposed_product(dialogue, context)
+    
+    # 🔥 NEW: Améliorer le score de visite avec le nouvel algorithme
+    improved_visit_score = improve_visit_score(
+        dialogue, 
+        objections_count=len(objections),
+        engagement_score=engagement_data["score"],
+        sentiment=predicted_sentiment
+    )
+    
     return {
         "type": rapport_type,
         "analysis": analysis,
@@ -588,8 +772,324 @@ Analyse le dialogue et fournis:
             "Délégué Messages": len([e for e in exchanges if e["speaker"] == "DÉLÉGUÉ"]),
             "Médecin Messages": len([e for e in exchanges if e["speaker"] == "MÉDECIN"])
         },
-        "exchanges": exchanges
+        "exchanges": exchanges,
+        # 🔥 NEW: Ajouter les nouvelles données
+        "detected_language": detected_language,
+        "medical_specialty": medical_specialty,
+        "engagement": engagement_data,
+        "detected_needs": detected_needs,
+        "client_typology": client_typology,
+        "proposed_product": proposed_product,
+        "visit_score": improved_visit_score,
+        "report_date": datetime.now().isoformat()
     }
+
+
+# ========================================
+# 4A. NOUVELLES FONCTIONS D'EXTRACTION (AMÉLIORATIONS)
+# ========================================
+
+def detect_language(text: str) -> str:
+    """
+    Détecte la langue du texte (français, anglais, arabe)
+    Retourne: "FRANÇAIS", "ANGLAIS", "ARABE", ou "MIXTE"
+    """
+    text_lower = text.lower()
+    
+    # Mots-clés français
+    french_keywords = ["bonjour", "merci", "docteur", "médecin", "prix", "efficacité", 
+                      "sécurité", "produit", "disponible", "cnam", "remboursement", "délégué",
+                      "étude", "données", "résultat", "bien", "oui", "non"]
+    
+    # Mots-clés anglais
+    english_keywords = ["hello", "thank", "doctor", "price", "efficacy", "safety", 
+                       "product", "available", "study", "data", "result", "yes", "no",
+                       "clinical", "patient", "treatment", "medication"]
+    
+    # Caractères arabes
+    arabic_pattern = re.compile(r'[\u0600-\u06FF]')
+    
+    # Compter les occurrences
+    fr_count = sum(1 for word in french_keywords if word in text_lower)
+    en_count = sum(1 for word in english_keywords if word in text_lower)
+    ar_count = len(arabic_pattern.findall(text))
+    
+    # Déterminer la langue dominante
+    if ar_count > 20:
+        if fr_count > 5 or en_count > 5:
+            return "MIXTE"
+        return "ARABE"
+    
+    if fr_count > en_count and fr_count > 5:
+        return "FRANÇAIS"
+    elif en_count > fr_count and en_count > 5:
+        return "ANGLAIS"
+    elif fr_count > 3:
+        return "FRANÇAIS"
+    elif en_count > 3:
+        return "ANGLAIS"
+    
+    return "FRANÇAIS"  # Par défaut
+
+
+def detect_medical_specialty(dialogue: str) -> str:
+    """
+    Détecte la spécialité médicale du dialogue
+    Retourne: "Cardiologie", "Dermatologie", "Gastroentérologie", etc.
+    """
+    text_lower = dialogue.lower()
+    
+    specialties = {
+        "Cardiologie": ["cardiaque", "cœur", "hypertension", "infarctus", "arythmie", "troponine", "ejection fraction", "tension", "tension artérielle", "tensionmètre"],
+        "Dermatologie": ["peau", "acné", "eczéma", "psoriasis", "dermatite", "hypoallergénique", "dermatologique", "rides", "cicatrice", "verrue"],
+        "Gastroentérologie": ["gastro", "estomac", "digestion", "foie", "intestin", "probiotique", "ibs", "ulcère", "reflux", "dyspepsie", "nausée"],
+        "Rhumatologie": ["arthrose", "articulation", "arthrite", "rhumatisme", "curcumine", "boswellia", "glucosamine", "douleur articulaire", "genou", "dos"],
+        "Pneumologie": ["poumon", "respiration", "asthme", "bronche", "tuberculose", "dyspnée", "toux", "essoufflement", "bronchite"],
+        "Neurologie": ["cerveau", "nerf", "épilepsie", "migraine", "parkinson", "sclérose", "neurologique", "vertiges", "tremblements"],
+        "Immunologie": ["immunitaire", "immunité", "infection", "grippe", "vaccin", "allergie", "système immunitaire", "inflammation", "antihistaminique"],
+        "Endocrinologie": ["glucose", "diabète", "thyroïde", "hormonal", "métabolisme", "insuline", "glycémie", "surpoids", "poids"],
+        "Antibiothérapie": ["antibiotique", "infection", "résistant", "blse", "pseudomonas", "sepsis", "infection bactérienne"],
+        "Sommeil": ["sommeil", "insomnie", "mélatonine", "dormir", "repos", "fatigue nocturne", "apnée", "ronflement"],
+        "Vitalité": ["fatigue", "énergie", "coq10", "ginseng", "vitalité", "asthénie", "faiblesse", "tonus", "dynamique"],
+    }
+    
+    best_specialty = "Médecine Générale"
+    best_count = 0
+    
+    for specialty, keywords in specialties.items():
+        count = sum(1 for keyword in keywords if keyword in text_lower)
+        if count > best_count:
+            best_count = count
+            best_specialty = specialty
+    
+    return best_specialty
+
+
+def detect_engagement(dialogue: str) -> dict:
+    """
+    Détecte si l'engagement est obtenu ou non
+    Retourne: {"obtained": bool, "score": float, "indicators": []}
+    """
+    text_lower = dialogue.lower()
+    
+    positive_indicators = [
+        "d'accord", "oui", "ok", "excellent", "parfait", "intéressé", "intéressant",
+        "je vais", "on peut", "très bien", "c'est bon", "je prends", "envoyer",
+        "me montrer", "je veux", "impressionné", "convaincu", "merveilleux",
+        "formidable", "ok d'accord", "je suis d'accord"
+    ]
+    
+    negative_indicators = [
+        "non", "pas intéressé", "déjà", "trop cher", "plus tard", "pas besoin",
+        "je n'ai pas", "je suis pressé", "pas convaincant", "doute", "inquiet",
+        "pas sûr", "je verrai", "peut-être", "pas vraiment", "risque"
+    ]
+    
+    positive_count = sum(1 for indicator in positive_indicators if indicator in text_lower)
+    negative_count = sum(1 for indicator in negative_indicators if indicator in text_lower)
+    
+    # Score d'engagement
+    total = positive_count + negative_count
+    if total == 0:
+        engagement_score = 0.5
+    else:
+        engagement_score = positive_count / total
+    
+    engagement_obtained = engagement_score > 0.6
+    
+    indicators = []
+    for indicator in positive_indicators:
+        if indicator in text_lower:
+            indicators.append(f"✅ {indicator}")
+    for indicator in negative_indicators:
+        if indicator in text_lower:
+            indicators.append(f"❌ {indicator}")
+    
+    return {
+        "obtained": engagement_obtained,
+        "score": float(engagement_score),
+        "indicators": indicators[:5]  # Top 5 indicators
+    }
+
+
+def extract_detected_needs(dialogue: str) -> list:
+    """
+    Extrait les besoins/symptômes détectés dans la conversation
+    Retourne: ["fatigue", "insomnie", "grippe", ...]
+    """
+    text_lower = dialogue.lower()
+    
+    # Dictionnaire des besoins/symptômes
+    needs_dict = {
+        "Fatigue": ["fatigue", "asthénie", "manque d'énergie", "épuisé", "fatigué"],
+        "Insomnie": ["insomnie", "sommeil", "dormir", "insomnies", "nuits blanches"],
+        "Grippe": ["grippe", "fièvre", "toux", "rhume", "viral"],
+        "Allergies": ["allergie", "allergique", "allergie", "rhinite", "urticaire"],
+        "Arthrose": ["arthrose", "douleur articulaire", "articulation", "arthrite"],
+        "Digestion": ["digestion", "intestinal", "gastrique", "reflux", "ulcère"],
+        "Stress": ["stress", "anxieux", "anxiété", "nervosité", "tension"],
+        "Douleur": ["douleur", "douleur", "mal", "souffre", "souffrance"],
+        "Infection": ["infection", "infectieuse", "bacterial", "virale"],
+        "Immunité": ["immunitaire", "immunité", "système immunitaire", "défense"],
+    }
+    
+    detected_needs = []
+    for need, keywords in needs_dict.items():
+        for keyword in keywords:
+            if keyword in text_lower and need not in detected_needs:
+                detected_needs.append(need)
+                break
+    
+    return detected_needs
+
+
+def classify_client_typology(dialogue: str) -> dict:
+    """
+    Classifie le type de client selon les 4 typologies:
+    - Promouvant (orgueilleux): valorisation, être le meilleur
+    - Facilitant (naïf): sécurité, confort, contact chaleureux
+    - Contrôlant: technique, teste le vendeur
+    - Analysant: cherche les preuves, études scientifiques
+    """
+    text_lower = dialogue.lower()
+    
+    typologies = {
+        "Promouvant": {
+            "keywords": ["meilleur", "référence", "première", "excellence", "professeur",
+                        "leader", "innovant", "avant-garde", "tendance", "reputation"],
+            "score": 0
+        },
+        "Facilitant": {
+            "keywords": ["sécurité", "confort", "bien", "chaleur", "facile", "simple",
+                        "accessible", "tolérance", "sûr", "doux", "contact"],
+            "score": 0
+        },
+        "Contrôlant": {
+            "keywords": ["technique", "données", "efficacité", "performance", "test",
+                        "contrôle", "vérifier", "preuve", "comment", "pourquoi",
+                        "mécanisme", "comparer"],
+            "score": 0
+        },
+        "Analysant": {
+            "keywords": ["étude", "preuve", "recherche", "scientifique", "données",
+                        "résultats", "évidence", "clinique", "peer-reviewed", "publication",
+                        "références", "littérature", "comparatif"],
+            "score": 0
+        }
+    }
+    
+    # Compter les occurrences
+    for typology in typologies:
+        for keyword in typologies[typology]["keywords"]:
+            typologies[typology]["score"] += text_lower.count(keyword)
+    
+    # Trouver le type dominant
+    dominant_type = max(typologies, key=lambda x: typologies[x]["score"])
+    
+    # Scores normalisés
+    total_score = sum(t["score"] for t in typologies.values())
+    if total_score == 0:
+        confidence = 0.0
+    else:
+        confidence = typologies[dominant_type]["score"] / total_score
+    
+    return {
+        "primary": dominant_type,
+        "confidence": float(confidence),
+        "all_types": {k: v["score"] for k, v in typologies.items()}
+    }
+
+
+def extract_proposed_product(dialogue: str, context_docs: list = None) -> str:
+    """
+    Extrait le produit proposé du dialogue et du contexte RAG
+    Utilise d'abord le contexte RAG, puis la conversation
+    """
+    text_lower = dialogue.lower()
+    
+    # Si on a du contexte RAG, extraire le produit du contexte
+    if context_docs and len(context_docs) > 0:
+        # Le document le plus pertinent généralement contient le produit
+        top_source = context_docs[0]
+        content = top_source.get("content", "")
+        metadata = top_source.get("metadata", {})
+        
+        # Chercher le nom du produit dans metadata (source fiable)
+        if metadata.get("product_name"):
+            return metadata.get("product_name").strip()
+        
+        # Chercher dans le contenu (ignorer visit_id)
+        if content and "visit_id" not in content.lower():
+            lines = content.strip().split('\n')
+            for line in lines:
+                line_clean = line.strip()
+                # Ignorer les lignes avec visit_id
+                if line_clean and "visit_id" not in line_clean.lower() and len(line_clean) > 5:
+                    # Retourner la première ligne significative
+                    return line_clean[:80] if len(line_clean) <= 80 else line_clean[:77] + "..."
+    
+    # Fallback: chercher dans la conversation
+    # Mots-clés pour les produits
+    product_keywords = [
+        "crème", "produit", "formule", "comprimé", "gélule", "traitement",
+        "médicament", "complément", "antibiotique", "probiotique", "gel", "lotion"
+    ]
+    
+    sentences = text_lower.split('.')
+    for sentence in sentences:
+        for keyword in product_keywords:
+            if keyword in sentence:
+                # Extraire le texte après le keyword
+                idx = sentence.find(keyword)
+                if idx != -1:
+                    text_after = sentence[idx:].strip()
+                    # Prendre max 80 caractères
+                    return text_after[:80] if len(text_after) <= 80 else text_after[:77] + "..."
+    
+    return "Non spécifié"
+
+
+def improve_visit_score(dialogue: str, objections_count: int = 0, 
+                       engagement_score: float = 0.5, sentiment: float = 0) -> float:
+    """
+    Améliore le calcul du score de visite
+    Prend en compte: sentiment, engagement, nombre d'objections, longueur du dialogue
+    """
+    # Score de base
+    base_score = 50
+    
+    # Bonus/Malus selon sentiment
+    if sentiment > 0.5:
+        base_score += 15
+    elif sentiment < -0.5:
+        base_score -= 15
+    
+    # Bonus selon engagement
+    if engagement_score > 0.7:
+        base_score += 20
+    elif engagement_score > 0.5:
+        base_score += 10
+    elif engagement_score < 0.3:
+        base_score -= 15
+    
+    # Malus selon objections (mais pas excessif)
+    objection_malus = min(objections_count * 3, 20)  # Max -20
+    base_score -= objection_malus
+    
+    # Bonus selon longueur du dialogue (engagement et discussion)
+    dialogue_length = len(dialogue.split())
+    if dialogue_length > 300:
+        base_score += 10
+    elif dialogue_length > 500:
+        base_score += 15
+    
+    # Bonus si médecin pose des questions (engagement)
+    if "?" in dialogue:
+        question_count = dialogue.count("?")
+        base_score += min(question_count * 2, 15)
+    
+    # Clamper entre 0 et 100
+    return float(max(0, min(100, base_score)))
 
 
 # ========================================
@@ -622,7 +1122,16 @@ def save_rapport(rapport: dict) -> str:
             for obj in rapport.get("objections", [])
         ],
         "sources_count": len(rapport.get("sources", [])),
-        "exchanges_count": len(rapport.get("exchanges", []))
+        "exchanges_count": len(rapport.get("exchanges", [])),
+        # 🔥 NEW: Ajouter les nouvelles données
+        "detected_language": rapport.get("detected_language"),
+        "medical_specialty": rapport.get("medical_specialty"),
+        "engagement": rapport.get("engagement"),
+        "detected_needs": rapport.get("detected_needs"),
+        "client_typology": rapport.get("client_typology"),
+        "proposed_product": rapport.get("proposed_product"),
+        "visit_score": rapport.get("visit_score"),
+        "report_date": rapport.get("report_date")
     }
     
     # Sauvegarder

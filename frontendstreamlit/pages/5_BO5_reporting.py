@@ -2,6 +2,15 @@
 # BO5 REPORTING avec RAG + GROQ
 # ========================================
 import streamlit as st
+
+# Pre-load and cache embedding models to prevent reloading on every rerun
+try:
+    from cached_models import load_finetuned_model, load_standard_model
+    _ = load_finetuned_model()
+    _ = load_standard_model()
+except Exception as e:
+    pass  # Models will be loaded on first use
+
 import pandas as pd
 import sys
 import os
@@ -10,6 +19,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from fpdf import FPDF
 import re
+import json
 
 # ========================================
 # FIX PATHS
@@ -20,6 +30,102 @@ BACKEND_DIR = os.path.join(BASE_DIR, "ai_backend")
 # Ajouter la racine au début du path
 sys.path.insert(0, BASE_DIR)
 sys.path.insert(0, BACKEND_DIR)
+
+# ========================================
+# FONCTION POUR SAUVEGARDER DANS CRM (MONGODB)
+# ========================================
+import requests
+
+def save_report_to_crm(
+    transcript,
+    doctor_name,
+    delegate_name,
+    specialty,
+    objections_detected,
+    main_objection_type,
+    strategies,
+    sentiment,
+    interest,
+    visit_score,
+    json_data,
+    # 🔥 NOUVEAUX PARAMÈTRES
+    detected_language=None,
+    medical_specialty=None,
+    engagement=None,
+    detected_needs=None,
+    client_typology=None,
+    proposed_product=None,
+    report_date=None
+):
+    """Sauvegarde le rapport dans MongoDB via l'API Node.js"""
+    try:
+        # URL de l'API Node.js
+        API_URL = "http://localhost:5000/api/reports"
+        
+        print(f"[DEBUG] Tentative de sauvegarde sur {API_URL}")
+        
+        # Données à envoyer
+        payload = {
+            "doctor_id": "DOC_001",  # Statique pour maintenant
+            "doctor_name": doctor_name,
+            "delegate_name": delegate_name or "Délégué",
+            "specialty": specialty,
+            "transcript": transcript,
+            "objections_detected": objections_detected,
+            "main_objection_type": main_objection_type,
+            "strategies": strategies,
+            "sentiment": float(sentiment) if sentiment else 0,
+            "interest": float(interest) if interest else 0,
+            "visit_score": float(visit_score) if visit_score else 0,
+            "json_data": json_data,
+            # 🔥 NOUVEAUX CHAMPS
+            "detected_language": detected_language or "FRANÇAIS",
+            "medical_specialty": medical_specialty or "Médecine Générale",
+            "engagement": engagement or {"obtained": False, "score": 0, "indicators": []},
+            "detected_needs": detected_needs or [],
+            "client_typology": client_typology or {"primary": "Analysant", "confidence": 0},
+            "proposed_product": proposed_product or "Non spécifié",
+            "report_date": report_date or datetime.now().isoformat()
+        }
+        
+        print(f"[DEBUG] Payload créé avec {len(str(payload))} caractères")
+        
+        # Envoyer la requête POST
+        response = requests.post(API_URL, json=payload, timeout=10)
+        
+        print(f"[DEBUG] Status code reçu: {response.status_code}")
+        print(f"[DEBUG] Response body: {response.text[:300]}")
+        
+        if response.status_code == 201:
+            data = response.json()
+            print(f"[DEBUG] Sauvegarde réussie: {data}")
+            return {
+                "success": True,
+                "message": data.get("message", "✅ Rapport sauvegardé"),
+                "visit_id": data.get("visit_id"),
+                "report_id": data.get("report_id")
+            }
+        else:
+            print(f"[DEBUG] Erreur {response.status_code}")
+            return {
+                "success": False,
+                "message": f"❌ Erreur {response.status_code}: {response.text}"
+            }
+    
+    except requests.exceptions.ConnectionError as e:
+        print(f"[DEBUG] Erreur de connexion: {str(e)}")
+        return {
+            "success": False,
+            "message": "❌ Erreur: Impossible de se connecter au serveur CRM (Node.js). Assurez-vous que le backend est lancé sur http://localhost:5000"
+        }
+    except Exception as e:
+        print(f"[DEBUG] Erreur générale: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        return {
+            "success": False,
+            "message": f"❌ Erreur lors de la sauvegarde: {str(e)}"
+        }
 
 # ========================================
 # FONCTION POUR GÉNÉRER PDF
@@ -40,6 +146,28 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         pdf.write(5, f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n")
         pdf.ln(3)
         
+        # 🔥 NEW: Afficher les informations de base du rapport
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.write(6, "Informations de la Visite\n")
+        pdf.set_font("Helvetica", "", 9)
+        
+        detected_language = result.get("detected_language", "FR")
+        medical_specialty = result.get("medical_specialty", "Médecine Générale")
+        proposed_product = result.get("proposed_product", "Non spécifié")
+        engagement = result.get("engagement", {})
+        detected_needs = result.get("detected_needs", [])
+        client_typology = result.get("client_typology", {})
+        
+        pdf.write(5, f"Langue: {detected_language}\n")
+        pdf.write(5, f"Spécialité: {medical_specialty}\n")
+        pdf.write(5, f"Produit: {proposed_product[:50]}\n")
+        pdf.write(5, f"Engagement: {'OUI' if engagement.get('obtained') else 'NON'}\n")
+        if detected_needs:
+            pdf.write(5, f"Besoins: {', '.join(detected_needs[:3])}\n")
+        if client_typology:
+            pdf.write(5, f"Profil Client: {client_typology.get('primary', 'N/A')}\n")
+        pdf.ln(3)
+        
         # Résumé
         pdf.set_font("Helvetica", "B", 10)
         pdf.write(6, "Resume de la Visite\n")
@@ -51,7 +179,7 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         
         # Score
         score_match = re.search(r'(\d+)\s*/\s*100', analysis_text)
-        score = int(score_match.group(1)) if score_match else 50
+        score = int(score_match.group(1)) if score_match else result.get("visit_score", 50)
         pdf.set_font("Helvetica", "B", 10)
         pdf.write(6, f"Score Performance: {score}/100\n")
         pdf.ln(3)
@@ -266,37 +394,64 @@ with col1:
 with col2:
     generate_btn = st.button("🚀 Générer Rapport avec IA", use_container_width=True)
 
-if generate_btn:
-    if not query_input.strip():
+# Vérifier si un rapport existe déjà en session_state
+# Si oui, l'afficher directement sans avoir besoin de regénérer
+if "bo5_result" in st.session_state and st.session_state.bo5_result:
+    st.info("✅ Rapport généré trouvé en mémoire (cliquez pour regénérer)")
+    use_existing = True
+else:
+    use_existing = False
+
+if generate_btn or use_existing:
+    if not use_existing and not query_input.strip():
         st.error("❌ Veuillez entrer la conversation")
     else:
-        with st.spinner("⏳ Analyse de la discussion..."):
-            try:
-                # Importer les services RAG
-                from rag.query.query_bo5_medical import analyze_conversation
-                
-                # Analyser la conversation complète
-                result = analyze_conversation(
-                    dialogue=query_input,
-                    rapport_type=rapport_type,
-                    top_k=top_k
-                )
-                
-                # Display Response
-                st.success("✅ Rapport généré!")
-                
-                # ========================================
-                # RÉSUMÉ COURT DE LA VISITE
-                # ========================================
-                st.markdown("---")
-                st.markdown("### 📋 Résumé de la Visite")
-                
-                # Générer un résumé court de ce qui s'est passé
+        if generate_btn:
+            # Regénérer le rapport
+            with st.spinner("⏳ Analyse de la discussion..."):
                 try:
-                    from services.rag_service import generate_response
+                    # Importer les services RAG
+                    from rag.query.query_bo5_medical import analyze_conversation
                     
-                    # Créer un prompt pour résumer la visite
-                    resume_prompt = f"""Basé sur cette conversation entre un délégué médical et un médecin, fais un résumé TRÈS COURT (3-4 lignes maximum) de:
+                    # Analyser la conversation complète
+                    result = analyze_conversation(
+                        dialogue=query_input,
+                        rapport_type=rapport_type,
+                        top_k=top_k
+                    )
+                    
+                    # Sauvegarder dans session_state pour persister entre les reruns
+                    st.session_state.bo5_result = result
+                    st.session_state.bo5_query_input = query_input
+                    st.session_state.bo5_rapport_type = rapport_type
+                    
+                except Exception as e:
+                    st.error(f"❌ Erreur lors de l'analyse: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    st.stop()
+        
+        # Afficher le rapport (soit généré, soit depuis session_state)
+        if "bo5_result" in st.session_state:
+            result = st.session_state.bo5_result
+            query_input_display = st.session_state.bo5_query_input
+            rapport_type_display = st.session_state.bo5_rapport_type
+            
+            # Display Response
+            st.success("✅ Rapport généré!")
+            
+            # ========================================
+            # RÉSUMÉ COURT DE LA VISITE
+            # ========================================
+            st.markdown("---")
+            st.markdown("### 📋 Résumé de la Visite")
+            
+            # Générer un résumé court de ce qui s'est passé
+            try:
+                from services.rag_service import generate_response
+                
+                # Créer un prompt pour résumer la visite
+                resume_prompt = f"""Basé sur cette conversation entre un délégué médical et un médecin, fais un résumé TRÈS COURT (3-4 lignes maximum) de:
 - Ce qui a été présenté/discuté
 - Les objections principales du médecin
 - Conclusion/accord
@@ -304,209 +459,425 @@ if generate_btn:
 Sois concis et factuel.
 
 Conversation:
-{query_input}"""
-                    
-                    resume = generate_response(
-                        query=resume_prompt,
-                        context_docs=[],
-                        system_prompt="Tu es un résumeur d'entretiens médicaux. Soit très concis."
-                    )
-                    
-                    st.markdown(f"**{resume}**")
-                    
-                except Exception as e:
-                    # Si la génération échoue, créer un résumé basé sur l'analyse
-                    first_lines = "\n".join(result["analysis"].split('\n')[:3])
-                    st.markdown(f"**{first_lines}**")
+{query_input_display}"""
                 
-                # ========================================
-                # DÉTAILS DÉPLIABLES
-                # ========================================
-                st.markdown("---")
-                st.markdown("### 📖 Détails Complets")
+                resume = generate_response(
+                    query=resume_prompt,
+                    context_docs=[],
+                    system_prompt="Tu es un résumeur d'entretiens médicaux. Soit très concis."
+                )
                 
-                # Stats du rapport
-                num_objections = len(result.get("objections", []))
-                num_sources = len(result.get("sources", []))
-                avg_score = sum(s["score"] for s in result.get("sources", [])) / num_sources if num_sources > 0 else 0
+                st.markdown(f"**{resume}**")
                 
-                # ========================================
-                # ANALYSE SIGNIFICATIVE DE LA VISITE
-                # ========================================
-                with st.expander("🎯 Évaluation de la Visite", expanded=True):
-                    # Générer des insights significatifs
-                    visite_score = None
-                    try:
-                        from services.rag_service import generate_response
-                        import re
-                        
-                        insights_prompt = f"""Analyse cette visite médicale et donne une évaluation STRUCTURÉE avec:
-1. **Score Global** (X/100): Comment s'est déroulée la visite globalement?
-2. **Points Forts** (2-3 bullets): Qu'est-ce qui a bien marché?
-3. **Points Faibles** (2-3 bullets): Qu'est-ce qui aurait pu mieux se passer?
-4. **Risques** (si applicable): Y a-t-il des risques identifiés?
-5. **Recommandations** (2-3 bullets): Que faire pour la prochaine visite?
-
-IMPORTANT: Format le score EXACTEMENT comme "Score Global: 45/100"
-
-Conversation:
-{query_input}"""
-                        
-                        insights = generate_response(
-                            query=insights_prompt,
-                            context_docs=[],
-                            system_prompt="Tu es un expert en ventes médicales. Fournis une analyse constructive et actionnable. Utilise le format exact pour le score: 'Score Global: XX/100'"
-                        )
-                        
-                        st.markdown(insights)
-                        
-                        # Extraire le score du rapport avec le pattern XX/100
-                        score_match = re.search(r'(\d+)\s*/\s*100', insights)
-                        if score_match:
-                            visite_score = int(score_match.group(1))
-                            print(f"[DEBUG] Score extrait: {visite_score}")
+            except Exception as e:
+                # Si la génération échoue, créer un résumé basé sur l'analyse
+                first_lines = "\n".join(result["analysis"].split('\n')[:3])
+                st.markdown(f"**{first_lines}**")
+            
+            # ========================================
+            # DÉTAILS DÉPLIABLES
+            # ========================================
+            st.markdown("---")
+            st.markdown("### 📖 Détails Complets")
+            
+            # Stats du rapport
+            num_objections = len(result.get("objections", []))
+            num_sources = len(result.get("sources", []))
+            avg_score = sum(s["score"] for s in result.get("sources", [])) / num_sources if num_sources > 0 else 0
+            
+            # 🔥 NEW: Afficher les informations générales du rapport
+            st.markdown("---")
+            # ========================================
+            # 🎯 AMÉLIORATIONS - NOUVELLE INTERFACE
+            # ========================================
+            st.markdown("---")
+            st.markdown("# 📊 Résumé des 8 Améliorations")
+            
+            # ========================================
+            # Section 1: INFOS FONDAMENTALES (3 colonnes)
+            # ========================================
+            st.markdown("### 🎯 Contexte de la Visite")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                language = result.get("detected_language", "FRANÇAIS")
+                st.metric(
+                    "🌐 Langue Détectée",
+                    language,
+                    help="Langue détectée automatiquement dans la conversation"
+                )
+            
+            with col2:
+                specialty = result.get("medical_specialty", "Médecine Générale")
+                st.metric(
+                    "👨‍⚕️ Spécialité Médicale",
+                    specialty,
+                    help="Domaine médical identifié par IA"
+                )
+            
+            with col3:
+                visit_score = result.get("visit_score", 0)
+                visit_score = min(100, max(0, visit_score))
+                st.metric(
+                    "⭐ Score de Visite",
+                    f"{visit_score:.0f}/100",
+                    help="Score global basé sur sentiment, engagement, objections"
+                )
+            
+            # ========================================
+            # Section 2: ENGAGEMENT (Détaillé)
+            # ========================================
+            st.markdown("---")
+            st.markdown("### 💼 Engagement Client")
+            
+            engagement = result.get("engagement", {})
+            engagement_obtained = engagement.get("obtained", False)
+            engagement_score = engagement.get("score", 0)
+            engagement_indicators = engagement.get("indicators", [])
+            
+            col1, col2 = st.columns([1.5, 2])
+            
+            with col1:
+                # Statut d'engagement
+                if engagement_obtained:
+                    st.success("✅ **ENGAGEMENT OBTENU**", icon="✅")
+                else:
+                    st.warning("❌ **ENGAGEMENT À CONFIRMER**", icon="⚠️")
+                
+                # Barre de score
+                st.progress(
+                    value=min(1.0, engagement_score),
+                    text=f"Score: {engagement_score:.0%}"
+                )
+            
+            with col2:
+                # Indicateurs explicites
+                st.markdown("**Indicateurs Détectés:**")
+                if engagement_indicators:
+                    for indicator in engagement_indicators[:5]:
+                        # Nettoyer les indicateurs
+                        indicator_clean = indicator.replace("✅", "").replace("❌", "").strip()
+                        if "✅" in indicator or "oui" in indicator.lower() or "accord" in indicator.lower():
+                            st.markdown(f"✅ {indicator_clean}")
                         else:
-                            print(f"[DEBUG] Pas de score trouvé dans: {insights[:200]}")
-                        
-                    except Exception as e:
-                        st.warning(f"⚠️ Impossible de générer l'analyse détaillée: {str(e)}")
-                    
-                    # Visualisation du score de visite
-                    st.markdown("---")
-                    
-                    # Créer un gauge chart pour le score de visite
-                    if visite_score is None:
-                        # Si on n'a pas pu extraire le score, utiliser la formule par défaut
-                        if num_objections > 0:
-                            visite_score = min(100, 50 + (num_objections * 8) + (avg_score * 30))
-                        else:
-                            visite_score = 70 + (avg_score * 30)
-                        print(f"[DEBUG] Score par défaut calculé: {visite_score}")
-                    
-                    visite_score = min(100, max(0, visite_score))
-                    
-                    fig_gauge = go.Figure(go.Indicator(
-                        mode="gauge+number+delta",
-                        value=visite_score,
-                        domain={'x': [0, 1], 'y': [0, 1]},
-                        title={'text': "Performance de la Visite"},
-                        delta={'reference': 50},
-                        gauge={
-                            'axis': {'range': [None, 100]},
-                            'bar': {'color': "darkblue"},
-                            'steps': [
-                                {'range': [0, 33], 'color': "lightgray"},
-                                {'range': [33, 66], 'color': "gray"},
-                                {'range': [66, 100], 'color': "lightgreen"}
-                            ],
-                            'threshold': {
-                                'line': {'color': "red", 'width': 4},
-                                'thickness': 0.75,
-                                'value': 90
-                            }
-                        }
-                    ))
-                    st.plotly_chart(fig_gauge, use_container_width=True)
+                            st.markdown(f"❌ {indicator_clean}")
+                else:
+                    st.markdown("*Aucun indicateur détecté*")
+            
+            # ========================================
+            # Section 3: BESOINS DÉTECTÉS
+            # ========================================
+            st.markdown("---")
+            st.markdown("### 🏥 Besoins Détectés")
+            
+            detected_needs = result.get("detected_needs", [])
+            if detected_needs:
+                # Afficher comme badges colorés
+                cols = st.columns(min(4, len(detected_needs)))
+                for idx, need in enumerate(detected_needs[:4]):
+                    with cols[idx % len(cols)]:
+                        st.markdown(f"""
+                        <div style='background-color: #E8F4F8; padding: 10px; border-radius: 5px; text-align: center; border-left: 4px solid #0088CC;'>
+                        <b>{need}</b>
+                        </div>
+                        """, unsafe_allow_html=True)
                 
-                # Analyse détaillée en expander
-                with st.expander("📝 Analyse Complète IA", expanded=False):
-                    st.write(result["analysis"])
+                # Afficher les besoins supplémentaires
+                if len(detected_needs) > 4:
+                    st.markdown(f"**Et {len(detected_needs) - 4} autre(s) besoin(s):** {', '.join(detected_needs[4:])}")
+            else:
+                st.info("Aucun besoin spécifique détecté dans cette visite")
+            
+            # ========================================
+            # Section 4: PROFIL CLIENT (4 Typologies)
+            # ========================================
+            st.markdown("---")
+            st.markdown("### 👤 Profil du Client")
+            
+            client_typology = result.get("client_typology", {})
+            if client_typology:
+                primary_type = client_typology.get("primary", "Analysant")
+                confidence = client_typology.get("confidence", 0)
+                all_types = client_typology.get("all_types", {})
                 
-                # Points clés en expander avec tableau
-                with st.expander("🎯 Points Clés & Statistiques", expanded=False):
-                    if result.get("key_points"):
-                        key_points_data = pd.DataFrame([
-                            {"Métrique": key, "Valeur": value}
-                            for key, value in result.get("key_points", {}).items()
-                        ])
-                        st.dataframe(key_points_data, use_container_width=True)
-                    else:
-                        for key, value in result.get("key_points", {}).items():
-                            st.write(f"**{key}:** {value}")
-                
-                # Objections détectées avec analyse
-                if result.get("objections"):
-                    with st.expander(f"🚫 Objections Détectées ({num_objections})", expanded=False):
-                        # Tableau des objections avec stratégies mieux visibles
-                        objections_data = pd.DataFrame([
-                            {
-                                "Objection": obj['type'],
-                                "Énoncé": obj['text'][:50] + "..." if len(obj['text']) > 50 else obj['text'],
-                            }
-                            for obj in result["objections"]
-                        ])
-                        st.dataframe(objections_data, use_container_width=True)
-                        
-                        # Stratégies pour chaque objection
-                        st.markdown("**✅ Stratégies de Réponse:**")
-                        for i, obj in enumerate(result["objections"], 1):
-                            col1, col2 = st.columns([1, 3])
-                            with col1:
-                                st.write(f"**{obj['type']}:**")
-                            with col2:
-                                st.write(obj['strategy'])
-                
-                # Sources avec contexte
-                with st.expander(f"📚 Sources Utilisées ({num_sources})", expanded=False):
-                    if num_sources > 0:
-                        st.info(f"Score moyen de pertinence: **{avg_score:.2f}** (plus proche de 1 = plus pertinent)")
-                        for i, source in enumerate(result["sources"], 1):
-                            col1, col2 = st.columns([1, 4])
-                            with col1:
-                                st.metric("Score", f"{source['score']:.2f}")
-                            with col2:
-                                st.write(source["content"][:300] + "...")
-                
-                # Export
-                st.markdown("---")
-                col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns([1.5, 1.5])
                 
                 with col1:
-                    try:
-                        pdf_bytes = generate_pdf_report(result, rapport_type)
-                        st.download_button(
-                            label="📥 Télécharger en PDF",
-                            data=pdf_bytes,
-                            file_name=f"rapport_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                            mime="application/pdf"
-                        )
-                    except Exception as e:
-                        st.error(f"❌ Erreur PDF: {str(e)}")
+                    st.markdown(f"**Profil Principal:** {primary_type}")
+                    st.progress(
+                        value=min(1.0, confidence),
+                        text=f"Confiance: {confidence:.0%}"
+                    )
+                    
+                    # Description du profil
+                    profile_descriptions = {
+                        "Promouvant": "🎖️ Valorise l'excellence et la différenciation",
+                        "Facilitant": "🤝 Cherche la sécurité et le confort",
+                        "Contrôlant": "🔬 Teste et vérifie les solutions",
+                        "Analysant": "📚 Demande études et preuves scientifiques"
+                    }
+                    
+                    if primary_type in profile_descriptions:
+                        st.markdown(f"*{profile_descriptions[primary_type]}*")
                 
                 with col2:
-                    if st.button("📊 Exporter en JSON"):
-                        st.download_button(
-                            label="Télécharger JSON",
-                            data=str(result),
-                            file_name=f"rapport_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                        )
-                
-                with col3:
-                    if st.button("💾 Sauvegarder"):
-                        try:
-                            from rag.query.query_bo5_medical import save_rapport
-                            filepath = save_rapport(result)
-                            st.success(f"✅ Rapport sauvegardé !\n📁 {filepath}")
-                        except Exception as e:
-                            st.error(f"❌ Erreur sauvegarde: {str(e)}")
-                            import traceback
-                            st.code(traceback.format_exc())
-                
-                # Afficher rapports existants
-                st.markdown("---")
-                st.subheader("📂 Rapports Sauvegardés")
-                
+                    st.markdown("**Profils Détectés:**")
+                    if all_types:
+                        # Créer un graphique radar ou barres
+                        for type_name, score in all_types.items():
+                            st.markdown(f"• {type_name}: {score:.0%}")
+            
+            # ========================================
+            # Section 5: PRODUIT PROPOSÉ
+            # ========================================
+            st.markdown("---")
+            st.markdown("### 💊 Produit Proposé")
+            
+            proposed_product = result.get("proposed_product", "Non spécifié")
+            
+            # Vérifier si c'est juste un visit_id
+            if "visit_id" in proposed_product.lower() or proposed_product == "Non spécifié":
+                st.warning("⚠️ Produit non identifié dans cette conversation")
+            else:
+                st.success(f"✅ **{proposed_product}**", icon="💊")
+                st.markdown(f"*Produit détecté automatiquement dans la conversation*")
+            
+            # ========================================
+            # Section 6: RÉSUMÉ GÉNÉRAL
+            # ========================================
+            st.markdown("---")
+            st.markdown("### 📋 Résumé de la Visite")
+            
+            summary_col1, summary_col2, summary_col3 = st.columns(3)
+            
+            with summary_col1:
+                st.markdown("""
+                <div style='background-color: #FFF3CD; padding: 15px; border-radius: 5px; border-left: 4px solid #FF9800;'>
+                <b>💬 Langage</b><br>
+                """ + language + """
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with summary_col2:
+                st.markdown(f"""
+                <div style='background-color: #E3F2FD; padding: 15px; border-radius: 5px; border-left: 4px solid #2196F3;'>
+                <b>🎯 Engagement</b><br>
+                {'OUI ✅' if engagement_obtained else 'À confirmer ⚠️'} ({engagement_score:.0%})
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with summary_col3:
+                st.markdown(f"""
+                <div style='background-color: #F3E5F5; padding: 15px; border-radius: 5px; border-left: 4px solid #9C27B0;'>
+                <b>⭐ Performance</b><br>
+                {visit_score:.0f}/100 {'🌟' if visit_score >= 80 else '✓' if visit_score >= 60 else '⚠️'}
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # ========================================
+            # ANALYSE SIGNIFICATIVE DE LA VISITE
+            # ========================================
+            st.markdown("---")
+            with st.expander("🎯 Analyse Détaillée de la Visite", expanded=False):
+                # Générer des insights significatifs
+                visite_score = None
                 try:
-                    from rag.query.query_bo5_medical import list_saved_rapports
-                    saved = list_saved_rapports()
+                    from services.rag_service import generate_response
+                    import re
                     
-                    if saved:
-                        for i, rapport in enumerate(saved[:5], 1):
-                            st.write(f"{i}. 📄 {rapport['filename']}")
-                    else:
-                        st.info("Aucun rapport sauvegardé pour le moment")
-                except ImportError as e:
-                    st.warning(f"⚠️ Rechargez la page si les listes ne s'affichent pas: {str(e)}")
+                    insights_prompt = f"""Analyse cette visite médicale et donne une évaluation STRUCTURÉE avec:
+1. **Points Forts** (2-3 bullets): Qu'est-ce qui a bien marché?
+2. **Points d'Amélioration** (2-3 bullets): Qu'est-ce qui aurait pu mieux se passer?
+3. **Recommandations** (2-3 bullets): Que faire pour la prochaine visite?
+4. **Stratégies** (si applicable): Stratégies proposées pour cette catégorie de client?
+
+Conversation:
+{query_input_display}"""
+                    
+                    insights = generate_response(
+                        query=insights_prompt,
+                        context_docs=[],
+                        system_prompt="Tu es un expert en ventes médicales. Fournis une analyse constructive et actionnable. Sois concis et pratique."
+                    )
+                    
+                    st.markdown(insights)
+                    
+                except Exception as e:
+                    st.warning(f"⚠️ Impossible de générer l'analyse détaillée: {str(e)}")
+            
+            # Analyse détaillée en expander
+            with st.expander("📝 Analyse Complète IA", expanded=False):
+                st.write(st.session_state.bo5_result["analysis"])
+            
+            # Points clés en expander avec tableau
+            with st.expander("🎯 Points Clés & Statistiques", expanded=False):
+                if st.session_state.bo5_result.get("key_points"):
+                    key_points_data = pd.DataFrame([
+                        {"Métrique": key, "Valeur": value}
+                        for key, value in st.session_state.bo5_result.get("key_points", {}).items()
+                    ])
+                    st.dataframe(key_points_data, use_container_width=True)
+                else:
+                    for key, value in st.session_state.bo5_result.get("key_points", {}).items():
+                        st.write(f"**{key}:** {value}")
+            
+            # Objections détectées avec analyse
+            if st.session_state.bo5_result.get("objections"):
+                with st.expander(f"🚫 Objections Détectées ({num_objections})", expanded=False):
+                    # Tableau des objections avec stratégies mieux visibles
+                    objections_data = pd.DataFrame([
+                        {
+                            "Objection": obj['type'],
+                            "Énoncé": obj['text'][:50] + "..." if len(obj['text']) > 50 else obj['text'],
+                        }
+                        for obj in st.session_state.bo5_result["objections"]
+                    ])
+                    st.dataframe(objections_data, use_container_width=True)
+                    
+                    # Stratégies pour chaque objection
+                    st.markdown("**✅ Stratégies de Réponse:**")
+                    for i, obj in enumerate(st.session_state.bo5_result["objections"], 1):
+                        col1, col2 = st.columns([1, 3])
+                        with col1:
+                            st.write(f"**{obj['type']}:**")
+                        with col2:
+                            st.write(obj['strategy'])
+            
+            # Sources avec contexte
+            with st.expander(f"📚 Sources Utilisées ({num_sources})", expanded=False):
+                if num_sources > 0:
+                    st.info(f"Score moyen de pertinence: **{avg_score:.2f}** (plus proche de 1 = plus pertinent)")
+                    for i, source in enumerate(st.session_state.bo5_result["sources"], 1):
+                        col1, col2 = st.columns([1, 4])
+                        with col1:
+                            st.metric("Score", f"{source['score']:.2f}")
+                        with col2:
+                            st.write(source["content"][:300] + "...")
+            
+            # Export
+            st.markdown("---")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                try:
+                    pdf_bytes = generate_pdf_report(st.session_state.bo5_result, st.session_state.bo5_rapport_type)
+                    st.download_button(
+                        label="📥 Télécharger en PDF",
+                        data=pdf_bytes,
+                        file_name=f"rapport_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"❌ Erreur PDF: {str(e)}")
+            
+            with col2:
+                if st.button("📊 Exporter en JSON"):
+                    st.download_button(
+                        label="Télécharger JSON",
+                        data=str(st.session_state.bo5_result),
+                        file_name=f"rapport_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                    )
+            
+            with col3:
+                if st.button("💾 Sauvegarder"):
+                    try:
+                        from rag.query.query_bo5_medical import save_rapport
+                        filepath = save_rapport(st.session_state.bo5_result)
+                        st.success(f"✅ Rapport sauvegardé !\n📁 {filepath}")
+                    except Exception as e:
+                        st.error(f"❌ Erreur sauvegarde: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+            
+            # 🆕 BOUTON SAUVEGARDER DANS CRM (MONGODB)
+            with col4:
+                if st.button("🗄️ Sauvegarder dans CRM", key="save_crm_btn"):
+                    print("[STREAMLIT DEBUG] Bouton cliqué !")
+                    
+                    with st.spinner("📤 Sauvegarde dans MongoDB..."):
+                        try:
+                            # Préparer les données
+                            objections_list = [obj['type'] for obj in st.session_state.bo5_result.get("objections", [])]
+                            strategies_dict = {
+                                obj['type']: obj['strategy'] 
+                                for obj in st.session_state.bo5_result.get("objections", [])
+                            }
+                            
+                            # Sentiments et intérêt (à extraire ou par défaut)
+                            sentiment_val = st.session_state.bo5_result.get("predicted_sentiment", 0)
+                            interest_val = st.session_state.bo5_result.get("predicted_interest", 70)
+                            visit_score_val = st.session_state.bo5_result.get("visit_score", visite_score if visite_score else 70)
+                            
+                            print(f"[STREAMLIT DEBUG] Données préparées: visit_score={visit_score_val}")
+                            
+                            # 🔥 NOUVELLES DONNÉES
+                            detected_language = st.session_state.bo5_result.get("detected_language", "FRANÇAIS")
+                            medical_specialty = st.session_state.bo5_result.get("medical_specialty", "Médecine Générale")
+                            engagement_data = st.session_state.bo5_result.get("engagement", {"obtained": False, "score": 0})
+                            detected_needs = st.session_state.bo5_result.get("detected_needs", [])
+                            client_typology = st.session_state.bo5_result.get("client_typology", {})
+                            proposed_product = st.session_state.bo5_result.get("proposed_product", "Non spécifié")
+                            report_date = st.session_state.bo5_result.get("report_date", datetime.now().isoformat())
+                            
+                            # Appeler la fonction de sauvegarde
+                            crm_result = save_report_to_crm(
+                                transcript=st.session_state.bo5_query_input[:2000],  # Limiter la taille
+                                doctor_name="Docteur Cardiologue",  # À adapter si data disponible
+                                delegate_name="Délégué Médical",
+                                specialty=st.session_state.bo5_rapport_type if st.session_state.bo5_rapport_type else "Général",
+                                objections_detected=objections_list,
+                                main_objection_type=objections_list[0] if objections_list else None,
+                                strategies=strategies_dict,
+                                sentiment=sentiment_val,
+                                interest=interest_val,
+                                visit_score=visit_score_val,
+                                json_data={
+                                    "analysis": st.session_state.bo5_result.get("analysis", "")[:1000],
+                                    "objections_count": len(objections_list),
+                                    "sources_count": len(st.session_state.bo5_result.get("sources", []))
+                                },
+                                # 🔥 NOUVEAUX PARAMÈTRES
+                                detected_language=detected_language,
+                                medical_specialty=medical_specialty,
+                                engagement=engagement_data,
+                                detected_needs=detected_needs,
+                                client_typology=client_typology,
+                                proposed_product=proposed_product,
+                                report_date=report_date
+                            )
+                            
+                            print(f"[STREAMLIT DEBUG] Résultat: {crm_result}")
+                            
+                            # Afficher le résultat IMMÉDIATEMENT
+                            if crm_result["success"]:
+                                st.success(crm_result["message"])
+                                st.info(f"📍 **Visit ID:** {crm_result['visit_id']}\n📋 **Report ID:** {crm_result['report_id']}")
+                            else:
+                                st.error(crm_result["message"])
+                                st.error(f"Détail: {crm_result.get('message')}")
+                                
+                        except Exception as e:
+                            print(f"[STREAMLIT ERROR] Exception: {str(e)}")
+                            import traceback
+                            print(traceback.format_exc())
+                            st.error(f"❌ Erreur exception: {str(e)}")
+                            st.code(traceback.format_exc())
+            
+            # Afficher rapports existants
+            st.markdown("---")
+            st.subheader("📂 Rapports Sauvegardés")
+            
+            try:
+                from rag.query.query_bo5_medical import list_saved_rapports
+                saved = list_saved_rapports()
+                
+                if saved:
+                    for i, rapport in enumerate(saved[:5], 1):
+                        st.write(f"{i}. 📄 {rapport['filename']}")
+                else:
+                    st.info("Aucun rapport sauvegardé pour le moment")
+            except ImportError as e:
+                st.warning(f"⚠️ Rechargez la page si les listes ne s'affichent pas: {str(e)}")
             
             except Exception as e:
                 st.error(f"❌ Erreur: {str(e)}")
@@ -578,6 +949,42 @@ with tab2:
             # TESTING OPTIONS
             # ========================================
             st.subheader("🧪 Tests Fine-tuning")
+            
+            # ========================================
+            # SECTION FINE-TUNING
+            # ========================================
+            st.markdown("---")
+            st.markdown("### 🔧 Fine-tuning du SentenceTransformer")
+            
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.write("Améliorez le modèle d'embeddings en le fine-tunant sur vos données médicales")
+            with col2:
+                finetune_epochs = st.number_input("Epochs", min_value=1, max_value=5, value=2)
+            
+            if st.button("🚀 Lancer Fine-tuning Complet", use_container_width=True):
+                with st.spinner("⏳ Fine-tuning en cours (peut prendre 2-5 min)..."):
+                    try:
+                        from rag.query.query_bo5_medical import full_finetuning_pipeline
+                        
+                        result = full_finetuning_pipeline(epochs=int(finetune_epochs))
+                        
+                        st.success("✅ Fine-tuning Terminé avec Succès !")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Train Accuracy", f"{result['train_accuracy']:.1%}")
+                        with col2:
+                            st.metric("Validation Accuracy", f"{result['validation_accuracy']:.1%}")
+                        
+                        st.info(f"💡 Le modèle fine-tuné est sauvegardé et sera utilisé pour les prochaines analyses.")
+                        
+                    except Exception as e:
+                        st.error(f"❌ Erreur fine-tuning: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+            
+            st.markdown("---")
             
             test_mode = st.radio(
                 "Mode de test:",
@@ -741,3 +1148,4 @@ with tab2:
         
         except Exception as e:
             st.error(f"❌ Erreur dataset JSON: {str(e)}")
+
