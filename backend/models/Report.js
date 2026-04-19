@@ -20,7 +20,6 @@ const ReportSchema = new mongoose.Schema({
   },
   doctor_name: String,
   delegate_name: String,
-  specialty: String,
   
   // NOUVELLES DONNÉES (AMÉLIORATIONS)
   detected_language: {

@@ -13,7 +13,6 @@ router.post("/", async (req, res) => {
       doctor_id = "DOC_001", // Statique pour maintenant
       doctor_name,
       delegate_name,
-      specialty,
       transcript,
       objections_detected = [],
       main_objection_type,
@@ -21,7 +20,15 @@ router.post("/", async (req, res) => {
       sentiment = 0,
       interest = 0,
       visit_score = 0,
-      json_data = {}
+      json_data = {},
+      // 🔥 NOUVEAUX CHAMPS
+      detected_language = "FRANÇAIS",
+      medical_specialty = "Médecine Générale",
+      engagement = null,
+      detected_needs = [],
+      client_typology = null,
+      proposed_product = null,
+      report_date = new Date()
     } = req.body;
 
     console.log(`[API] Création rapport pour Dr: ${doctor_name}`);
@@ -31,7 +38,6 @@ router.post("/", async (req, res) => {
       doctor_id,
       doctor_name,
       delegate_name,
-      specialty,
       transcript,
       objections_detected,
       main_objection_type,
@@ -39,7 +45,15 @@ router.post("/", async (req, res) => {
       sentiment,
       interest,
       visit_score,
-      json_data
+      json_data,
+      // 🔥 NOUVEAUX CHAMPS
+      detected_language,
+      medical_specialty,
+      engagement,
+      detected_needs,
+      client_typology,
+      proposed_product,
+      report_date
     });
 
     // Sauvegarder dans MongoDB
