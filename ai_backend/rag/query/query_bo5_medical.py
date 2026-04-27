@@ -56,7 +56,7 @@ EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 # ========================================
 # FINE-TUNING CONFIGURATION
 # ========================================
-FINETUNED_MODEL_PATH = Path("C:/AVA/models/finetuned_sentence_transformer")
+FINETUNED_MODEL_PATH = PROJECT_ROOT / "ai_backend" / "models" / "finetuned_sentence_transformer"
 FINETUNED_MODEL_PATH.mkdir(parents=True, exist_ok=True)
 
 
@@ -1673,44 +1673,82 @@ def improve_visit_score(
     sentiment: float = 0,
 ) -> float:
     """
-    Améliore le calcul du score de visite
-    Prend en compte: sentiment, engagement, nombre d'objections, longueur du dialogue
+    Améliore le calcul du score de visite - dynamique selon la discussion
+    Prend en compte: sentiment, engagement, objections, longueur, questions, mots-clés positifs
     """
-    # Score de base
     base_score = 50
 
-    # Bonus/Malus selon sentiment
-    if sentiment > 0.5:
-        base_score += 15
-    elif sentiment < -0.5:
-        base_score -= 15
-
-    # Bonus selon engagement
-    if engagement_score > 0.7:
+    # 1. SENTIMENT (±20 points)
+    if sentiment > 0.7:
         base_score += 20
-    elif engagement_score > 0.5:
-        base_score += 10
-    elif engagement_score < 0.3:
-        base_score -= 15
+    elif sentiment > 0.4:
+        base_score += 12
+    elif sentiment > 0:
+        base_score += 5
+    elif sentiment < -0.7:
+        base_score -= 20
+    elif sentiment < -0.4:
+        base_score -= 12
+    elif sentiment < 0:
+        base_score -= 5
 
-    # Malus selon objections (mais pas excessif)
-    objection_malus = min(objections_count * 3, 20)  # Max -20
-    base_score -= objection_malus
-
-    # Bonus selon longueur du dialogue (engagement et discussion)
-    dialogue_length = len(dialogue.split())
-    if dialogue_length > 300:
-        base_score += 10
-    elif dialogue_length > 500:
+    # 2. ENGAGEMENT (±25 points)
+    if engagement_score > 0.8:
+        base_score += 25
+    elif engagement_score > 0.6:
         base_score += 15
+    elif engagement_score > 0.4:
+        base_score += 8
+    elif engagement_score < 0.2:
+        base_score -= 20
 
-    # Bonus si médecin pose des questions (engagement)
-    if "?" in dialogue:
-        question_count = dialogue.count("?")
-        base_score += min(question_count * 2, 15)
+    # 3. OBJECTIONS - pénalité mais diminuée si bien gérées (0 à -15)
+    if objections_count == 0:
+        base_score += 5  # Bonus si aucune objection
+    else:
+        objection_malus = min(objections_count * 2, 15)
+        base_score -= objection_malus
+
+    # 4. LONGUEUR DIALOGUE - engagement (+10 points max)
+    dialogue_length = len(dialogue.split())
+    if dialogue_length > 500:
+        base_score += 10
+    elif dialogue_length > 300:
+        base_score += 6
+    elif dialogue_length > 150:
+        base_score += 3
+
+    # 5. QUESTIONS DU MEDECIN - engagement (+15 points max)
+    question_count = dialogue.lower().count("?")
+    base_score += min(question_count * 1.5, 15)
+
+    # 6. MOTS-CLÉS POSITIFS (+20 points max)
+    positive_keywords = [
+        "intéressant", "excellent", "bon", "oui", "d'accord", "effectivement",
+        "absolument", "ça me plaît", "bien sûr", "parfait", "test", "tester",
+        "ok", "d'accord", "considérer", "envisager", "prescrire"
+    ]
+    positive_count = sum(1 for keyword in positive_keywords if keyword in dialogue.lower())
+    base_score += min(positive_count * 1.5, 20)
+
+    # 7. MOTS-CLÉS NÉGATIFS (-15 points max)
+    negative_keywords = [
+        "trop cher", "pas intéressé", "non", "pas besoin", "doute", "risque",
+        "danger", "dangereux", "effet secondaire", "problème", "jam", "jamais"
+    ]
+    negative_count = sum(1 for keyword in negative_keywords if keyword in dialogue.lower())
+    base_score -= min(negative_count * 2, 15)
+
+    # 8. MOTS-CLÉS DE CONSENSUS - accord final (+10 points)
+    consensus_keywords = ["approuver", "accord", "consensus", "validé", "convenus"]
+    consensus_found = any(keyword in dialogue.lower() for keyword in consensus_keywords)
+    if consensus_found:
+        base_score += 10
 
     # Clamper entre 0 et 100
-    return float(max(0, min(100, base_score)))
+    final_score = max(0, min(100, base_score))
+    print(f"[SCORE DEBUG] Dialogue length: {dialogue_length} | Objections: {objections_count} | Sentiment: {sentiment:.2f} | Engagement: {engagement_score:.2f} | Final: {final_score}")
+    return float(final_score)
 
 
 # ========================================

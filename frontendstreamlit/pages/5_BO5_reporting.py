@@ -174,10 +174,10 @@ def save_report_to_crm(
 # FONCTION POUR GÉNÉRER PDF
 # ========================================
 def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
-    """Génère un PDF amélioré du rapport"""
+    """Génère un PDF complet et détaillé du rapport"""
     try:
         pdf = FPDF(format="A4", unit="mm")
-        pdf.set_margins(12, 12, 12)
+        pdf.set_margins(6, 6, 6)
         pdf.add_page()
 
         # Charger les fonts
@@ -192,162 +192,173 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         # ========================================
         # HEADER
         # ========================================
-        pdf.set_font("DejaVu", "B", 16)
-        pdf.set_text_color(25, 118, 210)  # Bleu
-        pdf.write(10, "RAPPORT BO5\n")
+        pdf.set_font("DejaVu", "B", 13)
+        pdf.set_text_color(25, 118, 210)
+        pdf.multi_cell(0, 5, "RAPPORT BO5", align="L")
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 10)
-        pdf.write(5, "Analyse Intelligente de Visite Medicale\n")
-        pdf.ln(3)
-
-        # Ligne de séparation
+        pdf.set_font("DejaVu", "", 7)
+        pdf.multi_cell(0, 3, "Analyse Intelligente de Visite Medicale", align="L")
+        
+        # Ligne séparation
         pdf.set_draw_color(25, 118, 210)
-        pdf.line(12, pdf.get_y(), 198, pdf.get_y())
-        pdf.ln(2)
+        pdf.line(6, pdf.get_y(), 204, pdf.get_y())
+        pdf.ln(0.5)
 
         # Date et type
-        pdf.set_font("DejaVu", "", 9)
-        pdf.write(4, f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')} | ")
-        pdf.write(4, f"Type: {rapport_type}\n")
-        pdf.ln(2)
+        pdf.set_font("DejaVu", "", 6)
+        date_text = f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')} | Type: {rapport_type}"
+        pdf.multi_cell(0, 2.5, date_text, align="L")
+        pdf.ln(0.3)
 
         # ========================================
-        # SECTION 1: METRIQUES CLÉS
+        # SECTION 1: METRIQUES
         # ========================================
-        pdf.set_font("DejaVu", "B", 11)
+        pdf.set_font("DejaVu", "B", 8)
         pdf.set_text_color(25, 118, 210)
-        pdf.write(6, "METRIQUES CLES\n")
+        pdf.multi_cell(0, 3, "METRIQUES CLES", align="L")
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 9)
+        pdf.set_font("DejaVu", "", 6)
 
-        detected_language = result.get("detected_language", "FRANÇAIS")
-        medical_specialty = result.get("medical_specialty", "Médecine Générale")
+        detected_language = result.get("detected_language", "FRANCAIS")
+        medical_specialty = result.get("medical_specialty", "Medecine Generale")
         visit_score = result.get("visit_score", 0)
         sentiment = result.get("predicted_sentiment", 0)
         interest = result.get("predicted_interest", 0)
 
-        metrics = [
-            f"Langue: {detected_language}",
-            f"Specialite: {medical_specialty}",
-            f"Score Visite: {visit_score}/100",
-            f"Sentiment: {sentiment:.1f}",
-            f"Interet: {interest}%",
-        ]
-        
-        for i, metric in enumerate(metrics):
-            if i % 2 == 0:
-                pdf.write(4, metric)
-            else:
-                pdf.write(4, " | " + metric + "\n")
-        if len(metrics) % 2 != 0:
-            pdf.ln(1)
-        pdf.ln(2)
+        # Utiliser multi_cell pour éviter les problèmes d'espace
+        pdf.multi_cell(0, 2, f"Langue: {detected_language} | Specialite: {medical_specialty[:25]} | Score: {visit_score}/100 | Sentiment: {sentiment:.1f} | Interet: {interest}%", align="L")
+        pdf.ln(0.2)
 
         # ========================================
-        # SECTION 2: RESUME DE LA VISITE
+        # SECTION 2: RESUME
         # ========================================
-        pdf.set_font("DejaVu", "B", 11)
+        pdf.set_font("DejaVu", "B", 8)
         pdf.set_text_color(25, 118, 210)
-        pdf.write(6, "RESUME DE LA VISITE\n")
+        pdf.multi_cell(0, 3, "RESUME DE LA VISITE", align="L")
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 9)
+        pdf.set_font("DejaVu", "", 6)
 
-        analysis_text = result.get("analysis", "Pas d'analyse disponible")
-        lines = analysis_text.split("\n")[:4]
-        for line in lines:
-            if line.strip():
-                pdf.multi_cell(0, 4, line[:90], align="L")
-        pdf.ln(2)
+        analysis_text = result.get("analysis", "Pas d'analyse")
+        pdf.multi_cell(0, 2.5, analysis_text[:350], align="L")
+        pdf.ln(0.2)
 
         # ========================================
         # SECTION 3: INFORMATIONS DETAILLEES
         # ========================================
-        pdf.set_font("DejaVu", "B", 11)
+        pdf.set_font("DejaVu", "B", 8)
         pdf.set_text_color(25, 118, 210)
-        pdf.write(6, "INFORMATIONS DETAILLEES\n")
+        pdf.multi_cell(0, 3, "INFORMATIONS DETAILLEES", align="L")
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 8)
+        pdf.set_font("DejaVu", "", 6)
 
-        # Engagement
         engagement = result.get("engagement", {})
         engagement_status = "OUI" if engagement.get("obtained") else "NON"
-        pdf.write(4, f"Engagement Obtenu: {engagement_status} | ")
-        pdf.write(4, f"Score: {int(engagement.get('score', 0)*100)}%\n")
+        engagement_score = int(engagement.get("score", 0)*100)
+        pdf.multi_cell(0, 2, f"Engagement: {engagement_status} ({engagement_score}%)", align="L")
 
-        # Besoins
         detected_needs = result.get("detected_needs", [])
-        needs_text = ", ".join(detected_needs[:3]) if detected_needs else "Aucun"
-        pdf.write(4, f"Besoins Detectes: {needs_text}\n")
+        needs = ", ".join(detected_needs) if detected_needs else "Aucun"
+        pdf.multi_cell(0, 2, f"Besoins Detectes: {needs[:65]}", align="L")
 
-        # Profil client
         client_typology = result.get("client_typology", {})
         profile = client_typology.get("primary", "N/A")
-        confidence = client_typology.get("confidence", 0)
-        pdf.write(4, f"Profil Client: {profile} ({int(confidence*100)}%)\n")
+        confidence = int(client_typology.get("confidence", 0)*100)
+        pdf.multi_cell(0, 2, f"Profil Client: {profile} ({confidence}%)", align="L")
 
-        # Produit
-        proposed_product = result.get("proposed_product", "Non specifie")
-        pdf.write(4, f"Produit Propose: {proposed_product[:60]}\n")
-        pdf.ln(2)
+        proposed_product = result.get("proposed_product", "N/A")
+        pdf.multi_cell(0, 2, f"Produit Propose: {proposed_product[:55]}", align="L")
+        pdf.ln(0.2)
 
         # ========================================
         # SECTION 4: OBJECTIONS
         # ========================================
         objections = result.get("objections", [])
         if objections:
-            pdf.set_font("DejaVu", "B", 11)
+            pdf.set_font("DejaVu", "B", 8)
             pdf.set_text_color(25, 118, 210)
-            pdf.write(6, f"OBJECTIONS DETAILLEES ({len(objections)})\n")
+            pdf.multi_cell(0, 3, f"OBJECTIONS DETAILLEES ({len(objections)})", align="L")
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("DejaVu", "", 8)
+            pdf.set_font("DejaVu", "", 6)
 
-            for i, obj in enumerate(objections[:3], 1):
+            for i, obj in enumerate(objections[:4], 1):
                 obj_type = obj.get("type", "N/A")
                 obj_text = obj.get("text", "")[:50]
-                pdf.write(3, f"{i}. {obj_type}\n")
-                pdf.write(3, f"   {obj_text}...\n")
-            pdf.ln(1)
+                pdf.multi_cell(0, 1.8, f"{i}. {obj_type}: {obj_text}", align="L")
+            pdf.ln(0.2)
 
         # ========================================
-        # SECTION 5: PRODUITS RECOMMANDES
+        # SECTION 5: STRATEGIES
+        # ========================================
+        strategies = result.get("objections", [])
+        if strategies:
+            pdf.set_font("DejaVu", "B", 8)
+            pdf.set_text_color(25, 118, 210)
+            pdf.multi_cell(0, 3, "STRATEGIES DE REPONSE", align="L")
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("DejaVu", "", 6)
+
+            for i, obj in enumerate(strategies[:3], 1):
+                strategy = obj.get("strategy", "")
+                if strategy:
+                    pdf.multi_cell(0, 1.8, f"{i}. {strategy[:70]}", align="L")
+            pdf.ln(0.2)
+
+        # ========================================
+        # SECTION 6: PRODUITS RECOMMANDES
         # ========================================
         recommended_products = result.get("recommended_products", [])
         if recommended_products:
-            pdf.set_font("DejaVu", "B", 11)
+            pdf.set_font("DejaVu", "B", 8)
             pdf.set_text_color(25, 118, 210)
-            pdf.write(6, f"PRODUITS RECOMMANDES ({len(recommended_products)})\n")
+            pdf.multi_cell(0, 3, f"PRODUITS RECOMMANDES ({len(recommended_products)})", align="L")
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("DejaVu", "", 8)
+            pdf.set_font("DejaVu", "", 6)
 
             for i, prod in enumerate(recommended_products[:4], 1):
-                prod_name = prod.get("name", "N/A")[:45]
+                prod_name = prod.get("name", "N/A")[:50]
                 prod_score = prod.get("score", 0)
-                pdf.write(3, f"{i}. {prod_name}\n")
-                pdf.write(3, f"   Score: {prod_score}/100\n")
-            pdf.ln(1)
+                pdf.multi_cell(0, 1.8, f"{i}. {prod_name} (Score: {prod_score}/100)", align="L")
+            pdf.ln(0.2)
 
         # ========================================
-        # SECTION 6: STATISTIQUES
+        # SECTION 7: STATISTIQUES
         # ========================================
-        pdf.set_font("DejaVu", "B", 11)
+        pdf.set_font("DejaVu", "B", 8)
         pdf.set_text_color(25, 118, 210)
-        pdf.write(6, "STATISTIQUES\n")
+        pdf.multi_cell(0, 3, "STATISTIQUES", align="L")
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 8)
+        pdf.set_font("DejaVu", "", 6)
 
         key_points = result.get("key_points", {})
         for key, value in list(key_points.items())[:5]:
-            pdf.write(3, f"{key}: {value}\n")
-        pdf.ln(2)
+            pdf.multi_cell(0, 1.8, f"{key}: {value}", align="L")
+        pdf.ln(0.2)
+
+        # ========================================
+        # SECTION 8: SOURCES
+        # ========================================
+        sources = result.get("sources", [])
+        if sources:
+            pdf.set_font("DejaVu", "B", 8)
+            pdf.set_text_color(25, 118, 210)
+            pdf.multi_cell(0, 3, f"SOURCES UTILISEES ({len(sources)})", align="L")
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("DejaVu", "", 5)
+
+            for i, source in enumerate(sources[:4], 1):
+                content = source.get("content", "")[:45]
+                score = source.get("score", 0)
+                pdf.multi_cell(0, 1.5, f"{i}. {content}... (score: {score:.2f})", align="L")
+            pdf.ln(0.2)
 
         # ========================================
         # FOOTER
         # ========================================
         pdf.set_draw_color(25, 118, 210)
-        pdf.line(12, pdf.get_y(), 198, pdf.get_y())
-        pdf.set_font("DejaVu", "", 7)
+        pdf.line(6, pdf.get_y(), 204, pdf.get_y())
+        pdf.set_font("DejaVu", "", 5)
         pdf.set_text_color(100, 100, 100)
-        pdf.write(3, "Rapport genere par systeme BO5 - Confidential | AVA Intelligence Artificielle")
+        pdf.multi_cell(0, 2, "Rapport genere par systeme BO5 - Confidential | AVA", align="L")
 
         pdf_output = pdf.output(dest="S")
         return bytes(pdf_output)
