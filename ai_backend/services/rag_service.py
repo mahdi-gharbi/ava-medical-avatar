@@ -6,11 +6,7 @@ from groq import Groq
 import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
-from pathlib import Path
 from sentence_transformers import SentenceTransformer
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from functools import lru_cache
 
 load_dotenv()
 
@@ -26,102 +22,54 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 # ========================================
 # Initialiser Chroma et Embedding
 # ========================================
+# NOTE PERF: On désactive l'usage du modèle fine-tuné pour éviter des chargements
+# lourds et des latences. Un seul modèle standard est utilisé partout.
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
-AI_BACKEND_DIR = Path(__file__).parent.parent
-FINETUNED_MODEL_PATH = AI_BACKEND_DIR / "models" / "finetuned_sentence_transformer"
 
-# Cache models globally to avoid reloading
-_finetuned_model_cache = None
+# Cache global du modèle standard (utilisé uniquement si on fait du scoring côté python)
 _standard_model_cache = None
 
-def get_finetuned_model():
-    """Retourne le modèle fine-tuné chargé en cache"""
-    global _finetuned_model_cache
-    if _finetuned_model_cache is None:
-        try:
-            if (FINETUNED_MODEL_PATH / "model.safetensors").exists() or (FINETUNED_MODEL_PATH / "pytorch_model.bin").exists():
-                _finetuned_model_cache = SentenceTransformer(str(FINETUNED_MODEL_PATH))
-            else:
-                _finetuned_model_cache = SentenceTransformer(EMBED_MODEL)
-        except Exception as e:
-            print(f"[ERROR] Failed to load fine-tuned model: {e}")
-            _finetuned_model_cache = SentenceTransformer(EMBED_MODEL)
-    return _finetuned_model_cache
 
-def get_standard_model():
-    """Retourne le modèle standard chargé en cache"""
+def get_standard_model() -> SentenceTransformer:
     global _standard_model_cache
     if _standard_model_cache is None:
         _standard_model_cache = SentenceTransformer(EMBED_MODEL)
     return _standard_model_cache
 
-# Load models once at startup (if accessed directly, not through Streamlit)
-# Lazy loading - only load when actually needed via get_finetuned_model() / get_standard_model()
-# finetuned_model and standard_model will be set in retrieve_context() when first called
 
-# Créer fonction d'embedding adaptée
-def get_embedding_function():
-    """Retourne la fonction d'embedding fine-tuné si elle existe, sinon standard"""
-    if (FINETUNED_MODEL_PATH / "model.safetensors").exists() or (FINETUNED_MODEL_PATH / "pytorch_model.bin").exists():
-        return embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=str(FINETUNED_MODEL_PATH)
-        )
-    else:
-        return embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=EMBED_MODEL
-        )
-
-def get_standard_embedding_function():
-    """Retourne TOUJOURS la fonction d'embedding standard (non fine-tuné)"""
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBED_MODEL
-    )
-
-# Créer deux clients Chroma distincts avec des embedding functions différentes
-# Cela permet de requêter la même collection avec différents modèles d'embedding
-emb_fn = get_embedding_function()
-standard_emb_fn = get_standard_embedding_function()
+emb_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 
-# Collections avec fine-tuned embeddings
-collection = chroma_client.get_or_create_collection(
-    name="global_docs",
-    embedding_function=emb_fn,
-    metadata={"hnsw:space": "cosine"}
-)
 
-# Collections avec standard embeddings  
-standard_collection = chroma_client.get_or_create_collection(
-    name="global_docs_standard",
-    embedding_function=standard_emb_fn,
-    metadata={"hnsw:space": "cosine"}
-)
-
-# Pour l'A/B testing: créer deux clients séparés pour requêter "products" avec différents embeddings
-chroma_client_finetuned = chromadb.PersistentClient(path=CHROMA_PATH)
-chroma_client_standard = chromadb.PersistentClient(path=CHROMA_PATH)
+def _get_collection(name: str):
+    """Récupère une collection Chroma avec embedding function (nécessaire pour query_texts)."""
+    try:
+        return chroma_client.get_collection(name, embedding_function=emb_fn)
+    except TypeError:
+        # Compatibilité avec anciennes versions de chromadb
+        return chroma_client.get_collection(name)
 
 # ========================================
 # RETRIEVER : Chercher dans Chroma (AMÉLIORÉ)
 # ========================================
-def retrieve_context(query: str, top_k: int = 5, use_finetuned: bool = True) -> list[dict]:
+def retrieve_context(query: str, top_k: int = 5, use_finetuned: bool = False) -> list[dict]:
     """
-    Cherche les documents pertinents dans Chroma avec re-ranking par embeddings
-    Permet véritable A/B testing en changeant le modèle d'embedding pour le scoring
+    Cherche les documents pertinents dans Chroma.
+    NOTE: le paramètre use_finetuned est conservé pour compatibilité API,
+    mais est ignoré (finetuned désactivé pour performance).
     
     Args:
         query: Question utilisateur
         top_k: Nombre de résultats
-        use_finetuned: Si True, utilise fine-tuned embeddings. Si False, utilise standard embeddings
+        use_finetuned: Conservé pour compatibilité; finetuned est désactivé et ignoré.
     
     Returns:
         Liste de documents avec scores recalculés par le modèle d'embedding sélectionné
     """
-    # Sélectionner le modèle d'embedding avec cache
-    embed_model = get_finetuned_model() if use_finetuned else get_standard_model()
-    model_type = "FINETUNED" if use_finetuned else "STANDARD"
-    print(f"🔹 [{model_type}] Retrieving context with {model_type} embeddings")
+    if use_finetuned:
+        print("⚠️  use_finetuned=True ignoré (finetuned désactivé pour performance).")
+    print("🔹 [STANDARD] Retrieving context with STANDARD embeddings")
     
     # 🔥 ENRICHIR la requête pour mieux matcher
     enriched_queries = [
@@ -132,7 +80,7 @@ def retrieve_context(query: str, top_k: int = 5, use_finetuned: bool = True) -> 
     ]
     
     all_results = []
-    seen_ids = set()
+    seen_ids = {}
     
     # Collections à chercher
     collection_names = ["products"]
@@ -141,11 +89,18 @@ def retrieve_context(query: str, top_k: int = 5, use_finetuned: bool = True) -> 
         collection_names.append("bo5_data")
     except:
         pass
+
+    # 🔥 NEW: case-based reasoning (visites historiques) si collection existante
+    try:
+        chroma_client.get_collection("bo6_visits")
+        collection_names.append("bo6_visits")
+    except:
+        pass
     
     # Chercher dans les collections
     for col_name in collection_names:
         try:
-            col = chroma_client.get_collection(col_name)
+            col = _get_collection(col_name)
             
             # Chercher avec plusieurs variantes de requête
             for enriched_query in enriched_queries:
@@ -161,48 +116,29 @@ def retrieve_context(query: str, top_k: int = 5, use_finetuned: bool = True) -> 
                 for i, doc in enumerate(results["documents"][0]):
                     doc_id = f"{col_name}_{results['ids'][0][i]}"
                     
-                    # Éviter doublons
-                    if doc_id in seen_ids:
-                        continue
-                    seen_ids.add(doc_id)
-                    
-                    all_results.append({
-                        "id": doc_id,
-                        "content": doc,
-                        "metadata": results["metadatas"][0][i] if results["metadatas"] else {},
-                        "original_score": 1 - float(results["distances"][0][i]),
-                        "source": col_name
-                    })
+                    original_score = 1 - float(results["distances"][0][i])
+                    metadata = results["metadatas"][0][i] if results["metadatas"] else {}
+
+                    # Éviter doublons: garder le meilleur score si revu via enriched_queries
+                    prev = seen_ids.get(doc_id)
+                    if prev is None or original_score > prev["original_score"]:
+                        seen_ids[doc_id] = {
+                            "id": doc_id,
+                            "content": doc,
+                            "metadata": metadata,
+                            "original_score": original_score,
+                            "score": original_score,
+                            "source": col_name,
+                        }
         except Exception as e:
             print(f"⚠️  Collection '{col_name}' not available: {str(e)}")
             continue
-    
-    # 🔥 RE-RANK all results using the selected embedding model
+
+    all_results = list(seen_ids.values())
+    all_results = sorted(all_results, key=lambda x: x["score"], reverse=True)[:top_k]
     if all_results:
-        try:
-            # Encode query with selected model
-            query_embedding = embed_model.encode(query)
-            
-            # Re-score each result
-            for result in all_results:
-                doc_embedding = embed_model.encode(result["content"])
-                # Compute cosine similarity
-                similarity = cosine_similarity(
-                    query_embedding.reshape(1, -1),
-                    doc_embedding.reshape(1, -1)
-                )[0][0]
-                result["score"] = float(similarity)
-            
-            # Re-rank by new score
-            all_results = sorted(all_results, key=lambda x: x["score"], reverse=True)[:top_k]
-            
-            avg_score = sum(r["score"] for r in all_results) / len(all_results)
-            print(f"📊 Retrieved {len(all_results)} docs re-ranked with {model_type} (avg score: {avg_score:.3f})")
-        except Exception as e:
-            print(f"⚠️  Re-ranking failed: {str(e)}")
-            # Fallback: sort by original score
-            all_results = sorted(all_results, key=lambda x: x["original_score"], reverse=True)[:top_k]
-    
+        avg_score = sum(r["score"] for r in all_results) / len(all_results)
+        print(f"📊 Retrieved {len(all_results)} docs (avg score: {avg_score:.3f})")
     return all_results
 
 # ========================================

@@ -164,13 +164,8 @@ def fine_tune_sentence_transformer(
 
 @lru_cache(maxsize=1)
 def get_sentence_transformer_finetuned() -> SentenceTransformer:
-    """Charge le modèle fine-tuné s'il existe, sinon charge le pré-entraîné"""
-    if (FINETUNED_MODEL_PATH / "pytorch_model.bin").exists():
-        print(f"✅ Chargement modèle fine-tuné: {FINETUNED_MODEL_PATH}")
-        return SentenceTransformer(str(FINETUNED_MODEL_PATH))
-    else:
-        print(f"⚠️ Pas de modèle fine-tuné trouvé. Utilisation du modèle pré-entraîné.")
-        return SentenceTransformer(EMBED_MODEL)
+    """Compat: finetuned désactivé pour performance, retourne le modèle standard."""
+    return SentenceTransformer(EMBED_MODEL)
 
 
 def full_finetuning_pipeline(
@@ -239,6 +234,220 @@ def full_finetuning_pipeline(
         "validation_accuracy": float(valid_acc),
         "message": f"Accuracy: Train={train_acc:.1%}, Validation={valid_acc:.1%}",
     }
+
+
+# ========================================
+# LLM FEATURE EXTRACTION (JSON STRICT) + VALIDATION + FALLBACK
+# ========================================
+
+
+def _extract_first_json_object(text: str) -> dict | None:
+    """Extrait et parse le premier objet JSON trouvé dans un texte."""
+    if not text:
+        return None
+
+    # Chercher le premier bloc {...}
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+
+    candidate = match.group(0).strip()
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
+
+
+def _validate_llm_features(data: dict) -> dict | None:
+    """Valide et normalise la sortie du LLM pour garantir compatibilité UI/CRM."""
+    if not isinstance(data, dict):
+        return None
+
+    out = {}
+
+    # Sentiment [-1, 1]
+    sentiment = data.get("predicted_sentiment", None)
+    try:
+        if sentiment is not None:
+            sentiment = float(sentiment)
+            sentiment = max(-1.0, min(1.0, sentiment))
+            out["predicted_sentiment"] = sentiment
+    except Exception:
+        pass
+
+    # Interest [0, 100]
+    interest = data.get("predicted_interest", None)
+    try:
+        if interest is not None:
+            interest = float(interest)
+            interest = max(0.0, min(100.0, interest))
+            out["predicted_interest"] = int(round(interest))
+    except Exception:
+        pass
+
+    # Engagement
+    engagement = data.get("engagement", None)
+    if isinstance(engagement, dict):
+        obtained = engagement.get("obtained", None)
+        score = engagement.get("score", None)
+        indicators = engagement.get("indicators", [])
+        try:
+            obtained = bool(obtained)
+        except Exception:
+            obtained = False
+
+        try:
+            score = float(score)
+        except Exception:
+            score = None
+
+        if score is not None:
+            # Autoriser sortie 0-100, normaliser en 0-1
+            if score > 1.0:
+                score = score / 100.0
+            score = max(0.0, min(1.0, score))
+
+        if not isinstance(indicators, list):
+            indicators = []
+        indicators = [str(x)[:120] for x in indicators][:5]
+
+        if score is not None:
+            out["engagement"] = {
+                "obtained": obtained,
+                "score": score,
+                "indicators": indicators,
+            }
+
+    # Needs
+    needs = data.get("detected_needs", None)
+    if isinstance(needs, list):
+        out["detected_needs"] = [str(n)[:40] for n in needs if str(n).strip()][:12]
+
+    # Client typology
+    typology = data.get("client_typology", None)
+    allowed = {"Promouvant", "Facilitant", "Contrôlant", "Analysant"}
+    if isinstance(typology, dict):
+        primary = typology.get("primary")
+        confidence = typology.get("confidence")
+        all_types = typology.get("all_types")
+
+        if isinstance(primary, str):
+            primary = primary.strip()
+        if primary not in allowed:
+            primary = None
+
+        try:
+            confidence = float(confidence)
+            if confidence > 1.0:
+                confidence = confidence / 100.0
+            confidence = max(0.0, min(1.0, confidence))
+        except Exception:
+            confidence = None
+
+        # all_types: accepter dict (pourcentages) ou list
+        if isinstance(all_types, dict):
+            # normaliser en pourcentages 0-100
+            norm = {}
+            for k, v in all_types.items():
+                if k in allowed:
+                    try:
+                        vv = float(v)
+                        if vv <= 1.0:
+                            vv = vv * 100.0
+                        norm[k] = round(max(0.0, min(100.0, vv)), 2)
+                    except Exception:
+                        continue
+            all_types = norm
+        else:
+            all_types = None
+
+        if primary and confidence is not None:
+            out["client_typology"] = {
+                "primary": primary,
+                "confidence": confidence,
+                "all_types": all_types or {},
+            }
+
+    # Proposed product
+    proposed_product = data.get("proposed_product", None)
+    if proposed_product is not None:
+        proposed_product = str(proposed_product).strip()
+        if proposed_product:
+            out["proposed_product"] = proposed_product[:120]
+
+    # Evidence (optionnel)
+    evidence = data.get("evidence", None)
+    if isinstance(evidence, dict):
+        out["evidence"] = evidence
+
+    # Exiger au moins 2 champs utiles pour considérer valide
+    useful = 0
+    for k in [
+        "engagement",
+        "detected_needs",
+        "client_typology",
+        "proposed_product",
+        "predicted_sentiment",
+        "predicted_interest",
+    ]:
+        if k in out:
+            useful += 1
+    return out if useful >= 2 else None
+
+
+def extract_features_with_llm(dialogue: str, context_docs: list[dict] | None = None) -> dict | None:
+    """Extrait des features via LLM en JSON strict. Retourne dict validé ou None."""
+    if context_docs is None:
+        context_docs = []
+
+    # Limiter la taille du dialogue pour tokens
+    dialogue = str(dialogue or "")
+    if len(dialogue) > 4500:
+        dialogue = dialogue[:800] + "\n...\n" + dialogue[-3500:]
+
+    # Mettre le dialogue dans le contexte pour respecter le template generate_response
+    llm_context = [{"content": f"DIALOGUE:\n{dialogue}"}] + (context_docs[:6] if context_docs else [])
+
+    system_prompt = (
+        "Tu es un extracteur d'informations strict pour des visites médicales. "
+        "Tu DOIS répondre en JSON valide uniquement, sans texte additionnel. "
+        "N'invente pas: si une info n'est pas clairement déductible, mets null ou liste vide."
+    )
+
+    query = (
+        "Extrais les features suivantes depuis le DIALOGUE (et le CONTEXTE si utile).\n\n"
+        "Règles importantes:\n"
+        "- Sortie: JSON strict, pas de markdown\n"
+        "- Utilise ces typologies EXACTES: Promouvant, Facilitant, Contrôlant, Analysant\n"
+        "- engagement.score doit être entre 0 et 1\n"
+        "- predicted_sentiment doit être entre -1 et 1\n"
+        "- predicted_interest doit être entre 0 et 100\n"
+        "- Ajoute evidence: extraits courts du dialogue pour audit\n\n"
+        "Schéma attendu:\n"
+        "{\n"
+        "  \"predicted_sentiment\": -0.2,\n"
+        "  \"predicted_interest\": 70,\n"
+        "  \"engagement\": {\"obtained\": true, \"score\": 0.75, \"indicators\": [\"...\"]},\n"
+        "  \"detected_needs\": [\"...\"],\n"
+        "  \"client_typology\": {\"primary\": \"Analysant\", \"confidence\": 0.67, \"all_types\": {\"Promouvant\": 10, \"Facilitant\": 10, \"Contrôlant\": 13, \"Analysant\": 67}},\n"
+        "  \"proposed_product\": \"...\",\n"
+        "  \"evidence\": {\n"
+        "     \"engagement\": [\"...\"],\n"
+        "     \"detected_needs\": [\"...\"],\n"
+        "     \"client_typology\": [\"...\"],\n"
+        "     \"proposed_product\": [\"...\"]\n"
+        "  }\n"
+        "}"
+    )
+
+    try:
+        raw = safe_generate_response(query, llm_context, system_prompt)
+        parsed = _extract_first_json_object(raw)
+        validated = _validate_llm_features(parsed) if parsed else None
+        return validated
+    except Exception as e:
+        print(f"⚠️ LLM feature extraction failed: {e}")
+        return None
 
 
 # ========================================
@@ -1074,7 +1283,7 @@ def analyze_conversation(
     dialogue: str,
     rapport_type: str = "Analyse Objections",
     top_k: int = 5,
-    use_finetuned: bool = True,
+    use_finetuned: bool = False,
 ) -> dict:
     """
     Pipeline complet d'analyse d'une visite médicale
@@ -1151,23 +1360,32 @@ Analyse le dialogue et fournis:
     )
 
     # 🔥 NEW: ML Predictions
-    predicted_main_objection, predicted_objection_score = predict_main_objection_type(
-        dialogue
-    )
-    predicted_sentiment = predict_sentiment(dialogue)
-    predicted_interest = predict_interest(dialogue)
+    predicted_main_objection, predicted_objection_score = predict_main_objection_type(dialogue)
 
     # 🔥 NEW: AMÉLIORATIONS - Extraire les nouvelles données
     detected_language = detect_language(dialogue)
     medical_specialty = detect_medical_specialty(dialogue)
-    engagement_data = detect_engagement(dialogue)
-    client_typology = classify_client_typology(dialogue)
-    # 🔥 charger produits (IMPORTANT)
-    products = load_products()  # ou passé en paramètre
 
-    # 🔥 utiliser TES fonctions
-    detected_needs = extract_detected_needs(dialogue)
-    proposed_product = extract_product_from_dialogue(dialogue, products)
+    # Produits (utilisés pour extraction fallback + recommandation)
+    products = load_products()
+
+    # 1) Extraction LLM (JSON strict) → 2) fallback heuristiques si invalide
+    llm_features = extract_features_with_llm(dialogue, context_docs=context)
+
+    if llm_features:
+        predicted_sentiment = llm_features.get("predicted_sentiment", predict_sentiment(dialogue))
+        predicted_interest = llm_features.get("predicted_interest", predict_interest(dialogue))
+        engagement_data = llm_features.get("engagement", detect_engagement(dialogue))
+        detected_needs = llm_features.get("detected_needs", extract_detected_needs(dialogue))
+        client_typology = llm_features.get("client_typology", classify_client_typology(dialogue))
+        proposed_product = llm_features.get("proposed_product", extract_product_from_dialogue(dialogue, products))
+    else:
+        predicted_sentiment = predict_sentiment(dialogue)
+        predicted_interest = predict_interest(dialogue)
+        engagement_data = detect_engagement(dialogue)
+        detected_needs = extract_detected_needs(dialogue)
+        client_typology = classify_client_typology(dialogue)
+        proposed_product = extract_product_from_dialogue(dialogue, products)
 
     recommended_products = recommend_products(dialogue, products, medical_specialty)
 
@@ -1175,8 +1393,8 @@ Analyse le dialogue et fournis:
     improved_visit_score = improve_visit_score(
         dialogue,
         objections_count=len(objections),
-        engagement_score=engagement_data["score"],
-        sentiment=predicted_sentiment,
+        engagement_score=float(engagement_data.get("score", 0.5)),
+        sentiment=float(predicted_sentiment or 0),
     )
 
     return {

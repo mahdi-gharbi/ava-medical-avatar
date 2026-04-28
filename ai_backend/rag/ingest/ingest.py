@@ -17,6 +17,7 @@ import json
 import chromadb
 from chromadb.utils import embedding_functions
 from pathlib import Path
+import pandas as pd
 
 # ── Config ───────────────────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
@@ -326,6 +327,111 @@ Source: upload_streamlit
         })
 
     add_documents(col, docs, ids, metas)
+
+
+# ── 6. Visites historiques (BO6 dataset) ─────────────────────────────────────
+def ingest_bo6_visits(csv_filename: str = "vital_bo6_dataset.csv", limit: int | None = None):
+    """Indexe les transcripts du dataset BO6 dans une collection dédiée (case-based RAG).
+
+    Documents: transcript enrichi (spécialité, objection, NBA)
+    Metadata: champs simples uniquement (str/int/float/bool) compatibles Chroma.
+    """
+    csv_path = DATA_DIR / csv_filename
+    if not csv_path.exists():
+        print(f"  ⚠️  BO6 dataset introuvable: {csv_path}")
+        return
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"  ❌ Erreur lecture CSV BO6: {e}")
+        return
+
+    if df.empty:
+        print("  ⚠️  BO6 dataset vide")
+        return
+
+    if limit is not None:
+        df = df.head(int(limit))
+
+    col = get_or_create_collection("bo6_visits")
+
+    docs, ids, metas = [], [], []
+
+    for _, row in df.iterrows():
+        visit_id = str(row.get("visit_id", "")).strip()
+        if not visit_id:
+            continue
+
+        transcript = str(row.get("transcript", "") or "").strip()
+        if not transcript:
+            continue
+
+        doctor_specialty = str(row.get("doctor_specialty", "") or "").strip()
+        doctor_persona = str(row.get("doctor_persona", "") or "").strip()
+        language = str(row.get("language", "") or "").strip()
+        main_objection_type = str(row.get("main_objection_type", "") or "").strip()
+        next_best_action = str(row.get("next_best_action", "") or "").strip()
+        product_name = str(row.get("product_name", "") or "").strip()
+        product_category = str(row.get("product_category", "") or "").strip()
+
+        # Normalisation légère des scores en metadata
+        def _to_float(val, default=0.0):
+            try:
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return float(default)
+                return float(val)
+            except Exception:
+                return float(default)
+
+        sentiment_score = _to_float(row.get("sentiment_score", 0.0), 0.0)
+        engagement_score = _to_float(row.get("engagement_score", 0.0), 0.0)
+        interest_level = _to_float(row.get("interest_level", 0.0), 0.0)
+
+        # Convention: engagement_score dataset semble souvent 0-100 → garder deux versions
+        engagement_score_0_1 = engagement_score / 100.0 if engagement_score > 1.0 else engagement_score
+        interest_level_0_100 = interest_level if interest_level <= 100.0 else min(100.0, interest_level)
+
+        text = f"""VISITE HISTORIQUE (BO6)
+Spécialité: {doctor_specialty}
+Persona: {doctor_persona}
+Langue: {language}
+Produit: {product_name} ({product_category})
+Objection principale: {main_objection_type}
+Next Best Action: {next_best_action}
+
+Transcript:
+{transcript}
+"""
+
+        docs.append({"text": text})
+        ids.append(f"bo6_{visit_id}")
+        metas.append(
+            safe_meta(
+                {
+                    "source": "vital_bo6_dataset",
+                    "type": "visit",
+                    "visit_id": visit_id,
+                    "doctor_specialty": doctor_specialty,
+                    "doctor_persona": doctor_persona,
+                    "language": language,
+                    "main_objection_type": main_objection_type,
+                    "next_best_action": next_best_action,
+                    "product_name": product_name,
+                    "product_category": product_category,
+                    "sentiment_score": sentiment_score,
+                    "engagement_score": engagement_score,
+                    "engagement_score_0_1": engagement_score_0_1,
+                    "interest_level": interest_level_0_100,
+                }
+            )
+        )
+
+    if not ids:
+        print("  ⚠️  Aucune visite BO6 indexable")
+        return
+
+    add_documents(col, docs, ids, metas)
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("🚀 Ingestion RAG ALIA — VITAL SA")
@@ -342,5 +448,9 @@ if __name__ == "__main__":
 
     print("\n🎯 4. Niveaux de compétence...")
     ingest_niveaux()
+
+    print("\n🧾 5. Visites historiques BO6 (case-based RAG)...")
+    ingest_bo6_visits()
+
     print("\n✅ Ingestion terminée !")
     print(f"   Base vectorielle sauvegardée dans : {CHROMA_DIR}")

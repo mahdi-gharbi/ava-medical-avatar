@@ -3,15 +3,13 @@
 # ========================================
 import streamlit as st
 
-# Pre-load and cache embedding models
+# Pre-load and cache embedding model (standard only)
 try:
-    from cached_models import load_finetuned_model, load_standard_model
+    from cached_models import load_standard_model
 
-    _ = load_finetuned_model()
-    _ = load_standard_model()  # ✅ IMPORTANT ()
-
+    _ = load_standard_model()
 except Exception as e:
-    print("⚠️ Model preload failed:", e)
+    print("⚠️ Standard model preload failed:", e)
 
 import pandas as pd
 import sys
@@ -22,6 +20,7 @@ import plotly.express as px
 from fpdf import FPDF
 import re
 import json
+from typing import Any
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 sys.path.insert(0, BASE_DIR)
@@ -79,6 +78,50 @@ sys.path.insert(0, BASE_DIR)
 import requests
 
 
+def get_crm_api_url() -> str:
+    """Resolve CRM API URL from env/secrets with a safe default."""
+    url = os.environ.get("CRM_API_URL")
+    if not url:
+        try:
+            url = st.secrets.get("CRM_API_URL")
+        except Exception:
+            url = None
+    return url or "http://localhost:5000/api/reports"
+
+
+def _pdf_sanitize_text(value: Any, max_token_len: int = 45) -> str:
+    """Prepare text for FPDF multi_cell.
+
+    FPDF fails when a single 'word' (no spaces) is longer than the available width.
+    We insert spaces in long tokens to force wrapping.
+    """
+    text = "" if value is None else str(value)
+
+    # Remove control chars that can break rendering
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text)
+    text = text.replace("\t", " ")
+
+    # Break very long tokens (URLs, IDs, JSON blobs)
+    def _break(m: re.Match) -> str:
+        token = m.group(0)
+        return " ".join(
+            token[i : i + max_token_len] for i in range(0, len(token), max_token_len)
+        )
+
+    # Any non-space sequence longer than max_token_len
+    text = re.sub(rf"\S{{{max_token_len + 1},}}", _break, text)
+    return text
+
+
+def _pdf_multicell(pdf: FPDF, txt: Any, h: float, font: tuple[str, str, int] | None = None) -> None:
+    """Multi-cell with safe wrapping and consistent left margin."""
+    if font is not None:
+        family, style, size = font
+        pdf.set_font(family, style, size)
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(0, h, _pdf_sanitize_text(txt), align="L")
+
+
 def save_report_to_crm(
     transcript,
     doctor_name,
@@ -102,7 +145,7 @@ def save_report_to_crm(
     """Sauvegarde le rapport dans MongoDB via l'API Node.js"""
     try:
         # URL de l'API Node.js
-        API_URL = "http://localhost:5000/api/reports"
+        API_URL = get_crm_api_url()
 
         print(f"[DEBUG] Tentative de sauvegarde sur {API_URL}")
 
@@ -157,7 +200,11 @@ def save_report_to_crm(
         print(f"[DEBUG] Erreur de connexion: {str(e)}")
         return {
             "success": False,
-            "message": "❌ Erreur: Impossible de se connecter au serveur CRM (Node.js). Assurez-vous que le backend est lancé sur http://localhost:5000",
+            "message": (
+                "❌ Erreur: Impossible de se connecter au serveur CRM (Node.js). "
+                f"URL utilisée: {API_URL}. "
+                "Assurez-vous que le backend est lancé et que MongoDB est connecté."
+            ),
         }
     except Exception as e:
         print(f"[DEBUG] Erreur générale: {str(e)}")
@@ -178,6 +225,7 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
     try:
         pdf = FPDF(format="A4", unit="mm")
         pdf.set_margins(6, 6, 6)
+        pdf.set_auto_page_break(auto=True, margin=10)
         pdf.add_page()
 
         # Charger les fonts
@@ -194,20 +242,18 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         # ========================================
         pdf.set_font("DejaVu", "B", 13)
         pdf.set_text_color(25, 118, 210)
-        pdf.multi_cell(0, 5, "RAPPORT BO5", align="L")
+        _pdf_multicell(pdf, "RAPPORT BO5", 5, ("DejaVu", "B", 13))
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 7)
-        pdf.multi_cell(0, 3, "Analyse Intelligente de Visite Medicale", align="L")
+        _pdf_multicell(pdf, "Analyse Intelligente de Visite Medicale", 3, ("DejaVu", "", 7))
         
         # Ligne séparation
         pdf.set_draw_color(25, 118, 210)
-        pdf.line(6, pdf.get_y(), 204, pdf.get_y())
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
         pdf.ln(0.5)
 
         # Date et type
-        pdf.set_font("DejaVu", "", 6)
         date_text = f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')} | Type: {rapport_type}"
-        pdf.multi_cell(0, 2.5, date_text, align="L")
+        _pdf_multicell(pdf, date_text, 2.5, ("DejaVu", "", 6))
         pdf.ln(0.3)
 
         # ========================================
@@ -215,9 +261,8 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         # ========================================
         pdf.set_font("DejaVu", "B", 8)
         pdf.set_text_color(25, 118, 210)
-        pdf.multi_cell(0, 3, "METRIQUES CLES", align="L")
+        _pdf_multicell(pdf, "METRIQUES CLES", 3, ("DejaVu", "B", 8))
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 6)
 
         detected_language = result.get("detected_language", "FRANCAIS")
         medical_specialty = result.get("medical_specialty", "Medecine Generale")
@@ -226,7 +271,12 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         interest = result.get("predicted_interest", 0)
 
         # Utiliser multi_cell pour éviter les problèmes d'espace
-        pdf.multi_cell(0, 2, f"Langue: {detected_language} | Specialite: {medical_specialty[:25]} | Score: {visit_score}/100 | Sentiment: {sentiment:.1f} | Interet: {interest}%", align="L")
+        _pdf_multicell(
+            pdf,
+            f"Langue: {detected_language} | Specialite: {str(medical_specialty)[:25]} | Score: {visit_score}/100 | Sentiment: {sentiment:.1f} | Interet: {interest}%",
+            2,
+            ("DejaVu", "", 6),
+        )
         pdf.ln(0.2)
 
         # ========================================
@@ -234,12 +284,11 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         # ========================================
         pdf.set_font("DejaVu", "B", 8)
         pdf.set_text_color(25, 118, 210)
-        pdf.multi_cell(0, 3, "RESUME DE LA VISITE", align="L")
+        _pdf_multicell(pdf, "RESUME DE LA VISITE", 3, ("DejaVu", "B", 8))
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 6)
 
         analysis_text = result.get("analysis", "Pas d'analyse")
-        pdf.multi_cell(0, 2.5, analysis_text[:350], align="L")
+        _pdf_multicell(pdf, str(analysis_text)[:1200], 2.5, ("DejaVu", "", 6))
         pdf.ln(0.2)
 
         # ========================================
@@ -247,26 +296,25 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         # ========================================
         pdf.set_font("DejaVu", "B", 8)
         pdf.set_text_color(25, 118, 210)
-        pdf.multi_cell(0, 3, "INFORMATIONS DETAILLEES", align="L")
+        _pdf_multicell(pdf, "INFORMATIONS DETAILLEES", 3, ("DejaVu", "B", 8))
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 6)
 
         engagement = result.get("engagement", {})
         engagement_status = "OUI" if engagement.get("obtained") else "NON"
         engagement_score = int(engagement.get("score", 0)*100)
-        pdf.multi_cell(0, 2, f"Engagement: {engagement_status} ({engagement_score}%)", align="L")
+        _pdf_multicell(pdf, f"Engagement: {engagement_status} ({engagement_score}%)", 2, ("DejaVu", "", 6))
 
         detected_needs = result.get("detected_needs", [])
         needs = ", ".join(detected_needs) if detected_needs else "Aucun"
-        pdf.multi_cell(0, 2, f"Besoins Detectes: {needs[:65]}", align="L")
+        _pdf_multicell(pdf, f"Besoins Detectes: {needs}", 2, ("DejaVu", "", 6))
 
         client_typology = result.get("client_typology", {})
         profile = client_typology.get("primary", "N/A")
         confidence = int(client_typology.get("confidence", 0)*100)
-        pdf.multi_cell(0, 2, f"Profil Client: {profile} ({confidence}%)", align="L")
+        _pdf_multicell(pdf, f"Profil Client: {profile} ({confidence}%)", 2, ("DejaVu", "", 6))
 
         proposed_product = result.get("proposed_product", "N/A")
-        pdf.multi_cell(0, 2, f"Produit Propose: {proposed_product[:55]}", align="L")
+        _pdf_multicell(pdf, f"Produit Propose: {proposed_product}", 2, ("DejaVu", "", 6))
         pdf.ln(0.2)
 
         # ========================================
@@ -276,14 +324,13 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         if objections:
             pdf.set_font("DejaVu", "B", 8)
             pdf.set_text_color(25, 118, 210)
-            pdf.multi_cell(0, 3, f"OBJECTIONS DETAILLEES ({len(objections)})", align="L")
+            _pdf_multicell(pdf, f"OBJECTIONS DETAILLEES ({len(objections)})", 3, ("DejaVu", "B", 8))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("DejaVu", "", 6)
 
             for i, obj in enumerate(objections[:4], 1):
                 obj_type = obj.get("type", "N/A")
                 obj_text = obj.get("text", "")[:50]
-                pdf.multi_cell(0, 1.8, f"{i}. {obj_type}: {obj_text}", align="L")
+                _pdf_multicell(pdf, f"{i}. {obj_type}: {obj_text}", 1.8, ("DejaVu", "", 6))
             pdf.ln(0.2)
 
         # ========================================
@@ -293,14 +340,13 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         if strategies:
             pdf.set_font("DejaVu", "B", 8)
             pdf.set_text_color(25, 118, 210)
-            pdf.multi_cell(0, 3, "STRATEGIES DE REPONSE", align="L")
+            _pdf_multicell(pdf, "STRATEGIES DE REPONSE", 3, ("DejaVu", "B", 8))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("DejaVu", "", 6)
 
             for i, obj in enumerate(strategies[:3], 1):
                 strategy = obj.get("strategy", "")
                 if strategy:
-                    pdf.multi_cell(0, 1.8, f"{i}. {strategy[:70]}", align="L")
+                    _pdf_multicell(pdf, f"{i}. {strategy}", 1.8, ("DejaVu", "", 6))
             pdf.ln(0.2)
 
         # ========================================
@@ -310,14 +356,13 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         if recommended_products:
             pdf.set_font("DejaVu", "B", 8)
             pdf.set_text_color(25, 118, 210)
-            pdf.multi_cell(0, 3, f"PRODUITS RECOMMANDES ({len(recommended_products)})", align="L")
+            _pdf_multicell(pdf, f"PRODUITS RECOMMANDES ({len(recommended_products)})", 3, ("DejaVu", "B", 8))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("DejaVu", "", 6)
 
             for i, prod in enumerate(recommended_products[:4], 1):
                 prod_name = prod.get("name", "N/A")[:50]
                 prod_score = prod.get("score", 0)
-                pdf.multi_cell(0, 1.8, f"{i}. {prod_name} (Score: {prod_score}/100)", align="L")
+                _pdf_multicell(pdf, f"{i}. {prod_name} (Score: {prod_score}/100)", 1.8, ("DejaVu", "", 6))
             pdf.ln(0.2)
 
         # ========================================
@@ -325,13 +370,12 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         # ========================================
         pdf.set_font("DejaVu", "B", 8)
         pdf.set_text_color(25, 118, 210)
-        pdf.multi_cell(0, 3, "STATISTIQUES", align="L")
+        _pdf_multicell(pdf, "STATISTIQUES", 3, ("DejaVu", "B", 8))
         pdf.set_text_color(0, 0, 0)
-        pdf.set_font("DejaVu", "", 6)
 
         key_points = result.get("key_points", {})
         for key, value in list(key_points.items())[:5]:
-            pdf.multi_cell(0, 1.8, f"{key}: {value}", align="L")
+            _pdf_multicell(pdf, f"{key}: {value}", 1.8, ("DejaVu", "", 6))
         pdf.ln(0.2)
 
         # ========================================
@@ -341,26 +385,36 @@ def generate_pdf_report(result: dict, rapport_type: str) -> bytes:
         if sources:
             pdf.set_font("DejaVu", "B", 8)
             pdf.set_text_color(25, 118, 210)
-            pdf.multi_cell(0, 3, f"SOURCES UTILISEES ({len(sources)})", align="L")
+            _pdf_multicell(pdf, f"SOURCES UTILISEES ({len(sources)})", 3, ("DejaVu", "B", 8))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("DejaVu", "", 5)
 
             for i, source in enumerate(sources[:4], 1):
                 content = source.get("content", "")[:45]
                 score = source.get("score", 0)
-                pdf.multi_cell(0, 1.5, f"{i}. {content}... (score: {score:.2f})", align="L")
+                _pdf_multicell(
+                    pdf,
+                    f"{i}. {content}... (score: {score:.2f})",
+                    1.5,
+                    ("DejaVu", "", 5),
+                )
             pdf.ln(0.2)
 
         # ========================================
         # FOOTER
         # ========================================
         pdf.set_draw_color(25, 118, 210)
-        pdf.line(6, pdf.get_y(), 204, pdf.get_y())
-        pdf.set_font("DejaVu", "", 5)
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
         pdf.set_text_color(100, 100, 100)
-        pdf.multi_cell(0, 2, "Rapport genere par systeme BO5 - Confidential | AVA", align="L")
+        _pdf_multicell(
+            pdf,
+            "Rapport genere par systeme BO5 - Confidential | AVA",
+            2,
+            ("DejaVu", "", 5),
+        )
 
         pdf_output = pdf.output(dest="S")
+        if isinstance(pdf_output, str):
+            pdf_output = pdf_output.encode("latin-1", "ignore")
         return bytes(pdf_output)
     except Exception as e:
         print(f"[PDF ERROR] {str(e)}")
@@ -1425,35 +1479,17 @@ with tab2:
                     "Epochs", min_value=1, max_value=5, value=2
                 )
 
-            if st.button("🚀 Lancer Fine-tuning Complet", use_container_width=True):
-                with st.spinner("⏳ Fine-tuning en cours (peut prendre 2-5 min)..."):
-                    try:
-                        from rag.query.query_bo5_medical import full_finetuning_pipeline
+            st.info(
+                "ℹ️ Fine-tuning désactivé: le pipeline utilise uniquement des embeddings standards "
+                "pour réduire la latence et éviter les heuristiques liées au finetuned."
+            )
 
-                        result = full_finetuning_pipeline(epochs=int(finetune_epochs))
-
-                        st.success("✅ Fine-tuning Terminé avec Succès !")
-
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric(
-                                "Train Accuracy", f"{result['train_accuracy']:.1%}"
-                            )
-                        with col2:
-                            st.metric(
-                                "Validation Accuracy",
-                                f"{result['validation_accuracy']:.1%}",
-                            )
-
-                        st.info(
-                            f"💡 Le modèle fine-tuné est sauvegardé et sera utilisé pour les prochaines analyses."
-                        )
-
-                    except Exception as e:
-                        st.error(f"❌ Erreur fine-tuning: {str(e)}")
-                        import traceback
-
-                        st.code(traceback.format_exc())
+            st.button(
+                "🚀 Lancer Fine-tuning Complet",
+                use_container_width=True,
+                disabled=True,
+                help="Fonction désactivée (embeddings standards uniquement).",
+            )
 
             st.markdown("---")
 
