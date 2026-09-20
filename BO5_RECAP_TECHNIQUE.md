@@ -692,7 +692,7 @@ GROQ_API_KEY=REDACTED_GROQ_KEY
 GROQ_MODEL=llama-3.3-70b-versatile
 
 # 🗄️ MONGODB
-MONGO_URI=mongodb+srv://ayaUser:12345aya@cluster0.ausnlfa.mongodb.net/ava_project?retryWrites=true&w=majority
+MONGO_URI=your_mongodb_connection_string
 
 # 🧠 CHROMA
 CHROMA_PATH=ai_backend/rag/chroma_db
